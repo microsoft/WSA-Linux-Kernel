@@ -3485,10 +3485,18 @@ static void __exit exit_hv_pci_drv(void)
 	hvpci_block_ops.read_block = NULL;
 	hvpci_block_ops.write_block = NULL;
 	hvpci_block_ops.reg_blk_invalidate = NULL;
+
+	hv_pci_arch_free();
 }
 
 static int __init init_hv_pci_drv(void)
 {
+	int ret;
+
+	ret = hv_pci_arch_init();
+	if (ret)
+		return ret;
+
 	/* Set the invalid domain number's bit, so it will not be used */
 	set_bit(HVPCI_DOM_INVALID, hvpci_dom_map);
 
