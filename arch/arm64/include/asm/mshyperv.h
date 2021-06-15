@@ -37,6 +37,7 @@ static inline void hyperv_early_init(void) {};
 extern void hv_set_vpreg(u32 reg, u64 value);
 extern u64 hv_get_vpreg(u32 reg);
 extern void hv_get_vpreg_128(u32 reg, struct hv_get_vp_registers_output *result);
+extern void __percpu **hyperv_pcpu_input_arg;
 
 static inline void hv_set_register(unsigned int reg, u64 value)
 {
