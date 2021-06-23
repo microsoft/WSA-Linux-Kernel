@@ -43,8 +43,6 @@
 #include <linux/delay.h>
 #include <linux/semaphore.h>
 #include <linux/irqdomain.h>
-#include <asm/irqdomain.h>
-#include <asm/apic.h>
 #include <linux/irq.h>
 #include <linux/msi.h>
 #include <linux/hyperv.h>
@@ -860,6 +858,9 @@ static int hv_pcifront_write_config(struct pci_bus *bus, unsigned int devfn,
 static struct pci_ops hv_pcifront_ops = {
 	.read  = hv_pcifront_read_config,
 	.write = hv_pcifront_write_config,
+#ifdef CONFIG_PCI_DOMAINS_GENERIC
+	.use_arch_sysdata = 1,
+#endif //CONFIG_PCI_DOMAINS_GENERIC
 };
 
 /*
@@ -1180,6 +1181,8 @@ static int hv_set_affinity(struct irq_data *data, const struct cpumask *dest,
 static void hv_irq_mask(struct irq_data *data)
 {
 	pci_msi_mask_irq(data);
+	if (data->parent_data->chip->irq_mask)
+		irq_chip_mask_parent(data);
 }
 
 /**
@@ -1296,6 +1299,8 @@ exit_unlock:
 		dev_err(&hbus->hdev->device,
 			"%s() failed: %#llx", __func__, res);
 
+	if (data->parent_data->chip->irq_unmask)
+		irq_chip_unmask_parent(data);
 	pci_msi_unmask_irq(data);
 }
 
