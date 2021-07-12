@@ -65,6 +65,7 @@ enum pci_protocol_version_t {
 	PCI_PROTOCOL_VERSION_1_1 = PCI_MAKE_VERSION(1, 1),	/* Win10 */
 	PCI_PROTOCOL_VERSION_1_2 = PCI_MAKE_VERSION(1, 2),	/* RS1 */
 	PCI_PROTOCOL_VERSION_1_3 = PCI_MAKE_VERSION(1, 3),	/* Vibranium */
+	PCI_PROTOCOL_VERSION_1_4 = PCI_MAKE_VERSION(1, 4),	/* WS2022 */
 };
 
 #define CPU_AFFINITY_ALL	-1ULL
@@ -74,6 +75,7 @@ enum pci_protocol_version_t {
  * first.
  */
 static enum pci_protocol_version_t pci_protocol_versions[] = {
+	PCI_PROTOCOL_VERSION_1_4,
 	PCI_PROTOCOL_VERSION_1_3,
 	PCI_PROTOCOL_VERSION_1_2,
 	PCI_PROTOCOL_VERSION_1_1,
@@ -123,6 +125,8 @@ enum pci_message_type {
 	PCI_CREATE_INTERRUPT_MESSAGE2	= PCI_MESSAGE_BASE + 0x17,
 	PCI_DELETE_INTERRUPT_MESSAGE2	= PCI_MESSAGE_BASE + 0x18, /* unused */
 	PCI_BUS_RELATIONS2		= PCI_MESSAGE_BASE + 0x19,
+	PCI_RESOURCES_ASSIGNED3         = PCI_MESSAGE_BASE + 0x1A,
+	PCI_CREATE_INTERRUPT_MESSAGE3   = PCI_MESSAGE_BASE + 0x1B,
 	PCI_MESSAGE_MAXIMUM
 };
 
@@ -231,6 +235,21 @@ struct hv_msi_desc {
 struct hv_msi_desc2 {
 	u8	vector;
 	u8	delivery_mode;
+	u16	vector_count;
+	u16	processor_count;
+	u16	processor_array[32];
+} __packed;
+
+/*
+ * struct hv_msi_desc3 - 1.3 version of hv_msi_desc
+ *	Everything is the same as in 'hv_msi_desc2' except that the size of the
+ *	'vector' field is larger to support bigger vector values. For ex: LPI
+ *	vectors on ARM.
+ */
+struct hv_msi_desc3 {
+	u32	vector;
+	u8	delivery_mode;
+	u8	reserved;
 	u16	vector_count;
 	u16	processor_count;
 	u16	processor_array[32];
@@ -382,6 +401,12 @@ struct pci_create_interrupt2 {
 	struct pci_message message_type;
 	union win_slot_encoding wslot;
 	struct hv_msi_desc2 int_desc;
+} __packed;
+
+struct pci_create_interrupt3 {
+	struct pci_message message_type;
+	union win_slot_encoding wslot;
+	struct hv_msi_desc3 int_desc;
 } __packed;
 
 struct pci_delete_interrupt {
@@ -1345,7 +1370,7 @@ static void hv_pci_compose_compl(void *context, struct pci_response *resp,
 
 static u32 hv_compose_msi_req_v1(
 	struct pci_create_interrupt *int_pkt, struct cpumask *affinity,
-	u32 slot, u8 vector, u8 vector_count)
+	u32 slot, u8 vector, u16 vector_count)
 {
 	int_pkt->message_type.type = PCI_CREATE_INTERRUPT_MESSAGE;
 	int_pkt->wslot.slot = slot;
@@ -1362,9 +1387,18 @@ static u32 hv_compose_msi_req_v1(
 	return sizeof(*int_pkt);
 }
 
+/*
+ * Create MSI w/ dummy vCPU set targeting just one vCPU, overwritten
+ * by subsequent retarget in hv_irq_unmask().
+ */
+static int hv_compose_msi_req_get_cpu(struct cpumask *affinity)
+{
+	return cpumask_first_and(affinity, cpu_online_mask);
+}
+
 static u32 hv_compose_msi_req_v2(
 	struct pci_create_interrupt2 *int_pkt, struct cpumask *affinity,
-	u32 slot, u8 vector, u8 vector_count)
+	u32 slot, u8 vector, u16 vector_count)
 {
 	int cpu;
 
@@ -1373,12 +1407,27 @@ static u32 hv_compose_msi_req_v2(
 	int_pkt->int_desc.vector = vector;
 	int_pkt->int_desc.vector_count = vector_count;
 	int_pkt->int_desc.delivery_mode = dest_Fixed;
+	cpu = hv_compose_msi_req_get_cpu(affinity);
+	int_pkt->int_desc.processor_array[0] =
+		hv_cpu_number_to_vp_number(cpu);
+	int_pkt->int_desc.processor_count = 1;
 
-	/*
-	 * Create MSI w/ dummy vCPU set targeting just one vCPU, overwritten
-	 * by subsequent retarget in hv_irq_unmask().
-	 */
-	cpu = cpumask_first_and(affinity, cpu_online_mask);
+	return sizeof(*int_pkt);
+}
+
+static u32 hv_compose_msi_req_v3(
+	struct pci_create_interrupt3 *int_pkt, struct cpumask *affinity,
+	u32 slot, u32 vector, u16 vector_count)
+{
+	int cpu;
+
+	int_pkt->message_type.type = PCI_CREATE_INTERRUPT_MESSAGE3;
+	int_pkt->wslot.slot = slot;
+	int_pkt->int_desc.vector = vector;
+	int_pkt->int_desc.reserved = 0;
+	int_pkt->int_desc.vector_count = vector_count;
+	int_pkt->int_desc.delivery_mode = APIC_DELIVERY_MODE_FIXED;
+	cpu = hv_compose_msi_req_get_cpu(affinity);
 	int_pkt->int_desc.processor_array[0] =
 		hv_cpu_number_to_vp_number(cpu);
 	int_pkt->int_desc.processor_count = 1;
@@ -1408,12 +1457,14 @@ static void hv_compose_msi_msg(struct irq_data *data, struct msi_msg *msg)
 	struct compose_comp_ctxt comp;
 	struct tran_int_desc *int_desc;
 	struct msi_desc *msi_desc;
-	u8 vector, vector_count;
+	u32 vector;
+	u16 vector_count;
 	struct {
 		struct pci_packet pci_pkt;
 		union {
 			struct pci_create_interrupt v1;
 			struct pci_create_interrupt2 v2;
+			struct pci_create_interrupt3 v3;
 		} int_pkts;
 	} __packed ctxt;
 
@@ -1490,6 +1541,14 @@ static void hv_compose_msi_msg(struct irq_data *data, struct msi_msg *msg)
 	case PCI_PROTOCOL_VERSION_1_2:
 	case PCI_PROTOCOL_VERSION_1_3:
 		size = hv_compose_msi_req_v2(&ctxt.int_pkts.v2,
+					dest,
+					hpdev->desc.win_slot.slot,
+					vector,
+					vector_count);
+		break;
+
+	case PCI_PROTOCOL_VERSION_1_4:
+		size = hv_compose_msi_req_v3(&ctxt.int_pkts.v3,
 					dest,
 					hpdev->desc.win_slot.slot,
 					vector,
