@@ -2100,6 +2100,7 @@ CONFIG_WLAN_VENDOR_MICROCHIP=y
 # CONFIG_MAC80211_HWSIM is not set
 # CONFIG_USB_NET_RNDIS_WLAN is not set
 CONFIG_VIRT_WIFI=y
+CONFIG_PROXY_WIFI=y
 
 #
 # Enable WiMAX (Networking options) to see the WiMAX drivers
