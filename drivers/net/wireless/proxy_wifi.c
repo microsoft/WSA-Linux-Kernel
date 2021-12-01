@@ -22,10 +22,10 @@
 static struct workqueue_struct *proxy_wifi_command_wq = NULL;
 
 /* Ports must be in host byte order */
-#define HV_WIFI_REQUEST_PORT 12345
-#define HV_WIFI_NOTIFICATION_PORT 12346
+#define PROXY_WIFI_REQUEST_PORT 12345
+#define PROXY_WIFI_NOTIFICATION_PORT 12346
 
-enum hv_wifi_operation {
+enum proxy_wifi_operation {
 	WIFI_INVALID = 0,
 	WIFI_OP_SCAN_REQUEST = 1,
 	WIFI_OP_SCAN_RESPONSE,
@@ -38,19 +38,19 @@ enum hv_wifi_operation {
 	WIFI_OP_MAX
 };
 
-enum hv_wifi_version {
+enum proxy_wifi_version {
 	Version_0_1 = 0x0001,
 };
 
-struct hv_wifi_hdr {
-	/* An enum hv_wifi_operation value */
+struct proxy_wifi_hdr {
+	/* An enum proxy_wifi_operation value */
 	u8 operation;
 	u32 size;
-	/* An enum hv_wifi_version value */
+	/* An enum proxy_wifi_version value */
 	u16 version;
 } __packed;
 
-struct hv_wifi_bss {
+struct proxy_wifi_bss {
 	u8 bssid[ETH_ALEN];
 	u16 capabilities;
 	u32 rssi;
@@ -60,18 +60,18 @@ struct hv_wifi_bss {
 	u32 ie_offset;
 } __packed;
 
-struct hv_wifi_scan_request {
+struct proxy_wifi_scan_request {
 	u8 ssid_len;
 	u8 ssid[IEEE80211_MAX_SSID_LEN];
 } __packed;
 
-struct hv_wifi_scan_response {
+struct proxy_wifi_scan_response {
 	u32 num_bss;
 	u32 total_size;
-	struct hv_wifi_bss bss[];
+	struct proxy_wifi_bss bss[];
 } __packed;
 
-struct hv_wifi_connect_request {
+struct proxy_wifi_connect_request {
 	u8 ssid_len;
 	u8 ssid[IEEE80211_MAX_SSID_LEN];
 	u8 bssid[ETH_ALEN];
@@ -86,36 +86,36 @@ struct hv_wifi_connect_request {
 	u8 key[];
 } __packed;
 
-struct hv_wifi_connect_response {
+struct proxy_wifi_connect_response {
 	u16 result_code;
 	u8 bssid[ETH_ALEN];
 	u64 session_id;
 } __packed;
 
-struct hv_wifi_disconnect_request {
+struct proxy_wifi_disconnect_request {
 	u64 session_id;
 } __packed;
 
-struct hv_wifi_disconnect_notif {
+struct proxy_wifi_disconnect_notif {
 	u64 session_id;
 } __packed;
 
-struct hv_wifi_signal_quality_notif {
+struct proxy_wifi_signal_quality_notif {
 	s8 signal;
 } __packed;
 
-struct hv_wifi_msg {
-	struct hv_wifi_hdr hdr;
+struct proxy_wifi_msg {
+	struct proxy_wifi_hdr hdr;
 	u8 *body;
 };
 
-static int build_scan_request_msg(struct hv_wifi_msg *message,
+static int build_scan_request_msg(struct proxy_wifi_msg *message,
                                   const struct cfg80211_scan_request* scan_params)
 {
-	struct hv_wifi_scan_request *scan_request = NULL;
+	struct proxy_wifi_scan_request *scan_request = NULL;
 
 	message->hdr.operation = WIFI_OP_SCAN_REQUEST;
-	message->hdr.size = sizeof(struct hv_wifi_scan_request);
+	message->hdr.size = sizeof(struct proxy_wifi_scan_request);
 	message->hdr.version = Version_0_1;
 
 	message->body = kzalloc(message->hdr.size, GFP_KERNEL);
@@ -123,7 +123,7 @@ static int build_scan_request_msg(struct hv_wifi_msg *message,
 		return -ENOMEM;
 
 	if (scan_params->n_ssids > 0) {
-		scan_request = (struct hv_wifi_scan_request *)message->body;
+		scan_request = (struct proxy_wifi_scan_request *)message->body;
 		scan_request->ssid_len = scan_params->ssids[0].ssid_len;
 		memcpy(scan_request->ssid, scan_params->ssids[0].ssid,
 		       sizeof(scan_request->ssid));
@@ -131,11 +131,11 @@ static int build_scan_request_msg(struct hv_wifi_msg *message,
 	return 0;
 }
 
-static int build_connect_request_message(struct hv_wifi_msg *message,
-					 const struct hv_wifi_connect_request *connection_params)
+static int build_connect_request_message(struct proxy_wifi_msg *message,
+					 const struct proxy_wifi_connect_request *connection_params)
 {
 	message->hdr.operation = WIFI_OP_CONNECT_REQUEST;
-	message->hdr.size = sizeof(struct hv_wifi_connect_request) +
+	message->hdr.size = sizeof(struct proxy_wifi_connect_request) +
 			    connection_params->key_len;
 	message->hdr.version = Version_0_1;
 
@@ -147,20 +147,20 @@ static int build_connect_request_message(struct hv_wifi_msg *message,
 	return 0;
 }
 
-static int build_disconnect_request_message(struct hv_wifi_msg *message,
+static int build_disconnect_request_message(struct proxy_wifi_msg *message,
 					    u64 session_id)
 {
-	struct hv_wifi_disconnect_request *disconnect_request = NULL;
+	struct proxy_wifi_disconnect_request *disconnect_request = NULL;
 
 	message->hdr.operation = WIFI_OP_DISCONNECT_REQUEST;
-	message->hdr.size = sizeof(struct hv_wifi_disconnect_request);
+	message->hdr.size = sizeof(struct proxy_wifi_disconnect_request);
 	message->hdr.version = Version_0_1;
 
 	message->body = kzalloc(message->hdr.size, GFP_KERNEL);
 	if (!message->body)
 		return -ENOMEM;
 
-	disconnect_request = (struct hv_wifi_disconnect_request *)message->body;
+	disconnect_request = (struct proxy_wifi_disconnect_request *)message->body;
 	disconnect_request->session_id = session_id;
 
 	return 0;
@@ -192,8 +192,8 @@ static int receive_bytes(struct socket *socket, size_t expected_size,
 	return 0;
 }
 
-static int receive_hv_wifi_message(struct socket *socket,
-				   struct hv_wifi_msg *message)
+static int receive_proxy_wifi_message(struct socket *socket,
+				   struct proxy_wifi_msg *message)
 {
 	int error = 0;
 
@@ -257,8 +257,8 @@ static int send_bytes(struct socket *socket, size_t message_size, u8 *buffer)
 	return 0;
 }
 
-static int send_hv_wifi_message(struct socket *socket,
-				struct hv_wifi_msg *message)
+static int send_proxy_wifi_message(struct socket *socket,
+				struct proxy_wifi_msg *message)
 {
 	int error = 0;
 
@@ -279,7 +279,7 @@ static int send_hv_wifi_message(struct socket *socket,
 	return 0;
 }
 
-static int query_host(struct hv_wifi_msg *message, unsigned int port)
+static int query_host(struct proxy_wifi_msg *message, unsigned int port)
 {
 	int error = 0;
 	struct socket *socket = NULL;
@@ -302,13 +302,13 @@ static int query_host(struct hv_wifi_msg *message, unsigned int port)
 		goto out_sock_release;
 	}
 
-	error = send_hv_wifi_message(socket, message);
+	error = send_proxy_wifi_message(socket, message);
 	if (error < 0) {
 		pr_err("proxy_wifi: Failed to send message, error %d", error);
 		goto out_sock_release;
 	}
 
-	error = receive_hv_wifi_message(socket, message);
+	error = receive_proxy_wifi_message(socket, message);
 	if (error < 0) {
 		pr_err("proxy_wifi: Failed to receive an answer, error %d", error);
 		goto out_sock_release;
@@ -321,10 +321,10 @@ out_sock_release:
 	return error;
 }
 
-static struct hv_wifi_msg scan_command(unsigned int port, const struct cfg80211_scan_request* scan_request)
+static struct proxy_wifi_msg scan_command(unsigned int port, const struct cfg80211_scan_request* scan_request)
 {
 	int error = 0;
-	struct hv_wifi_msg message = {0};
+	struct proxy_wifi_msg message = {0};
 
 	pr_info("proxy_wifi: Sending SCAN request to host");
 
@@ -348,11 +348,11 @@ error:
 	return message;
 }
 
-static struct hv_wifi_msg connect_command(unsigned int port,
-					  const struct hv_wifi_connect_request *connection_params)
+static struct proxy_wifi_msg connect_command(unsigned int port,
+					  const struct proxy_wifi_connect_request *connection_params)
 {
 	int error = 0;
-	struct hv_wifi_msg message = {0};
+	struct proxy_wifi_msg message = {0};
 
 	pr_info("proxy_wifi: Sending CONNECT request to host");
 
@@ -378,10 +378,10 @@ error:
 	return message;
 }
 
-static struct hv_wifi_msg disconnect_command(unsigned int port, u64 session_id)
+static struct proxy_wifi_msg disconnect_command(unsigned int port, u64 session_id)
 {
 	int error = 0;
-	struct hv_wifi_msg message = {0};
+	struct proxy_wifi_msg message = {0};
 
 	pr_info("proxy_wifi: Sending DISCONNECT request to host");
 
@@ -435,7 +435,7 @@ struct proxy_wifi_netdev_priv {
 	bool being_deleted;
 	struct connection_state connection;
 	/* Not protected, but access are sequential */
-	struct hv_wifi_connect_request *connect_req_ctx;
+	struct proxy_wifi_connect_request *connect_req_ctx;
 	unsigned int request_port;
 	unsigned int notification_port;
 };
@@ -444,19 +444,19 @@ static void proxy_wifi_disconnect_finalize(struct net_device *netdev,
 					  u16 reason_code);
 
 static void handle_disconnected_notification(struct proxy_wifi_netdev_priv *priv,
-					     struct hv_wifi_msg message)
+					     struct proxy_wifi_msg message)
 {
-	struct hv_wifi_disconnect_notif *disconnect_notif = NULL;
+	struct proxy_wifi_disconnect_notif *disconnect_notif = NULL;
 	u64 session_id = 0;
 
 	netdev_info(priv->upperdev, "proxy_wifi: Handling a disconnected notification\n");
 
-	if (message.hdr.size != sizeof(struct hv_wifi_disconnect_notif))
+	if (message.hdr.size != sizeof(struct proxy_wifi_disconnect_notif))
 		netdev_warn(priv->upperdev,
 			    "proxy_wifi: Unexpected size for a disconnect notification: %d bytes\n",
 			    message.hdr.size);
 
-	disconnect_notif = (struct hv_wifi_disconnect_notif *)message.body;
+	disconnect_notif = (struct proxy_wifi_disconnect_notif *)message.body;
 
 	read_lock(&proxy_wifi_connection_lock);
 	session_id = priv->connection.session_id;
@@ -474,19 +474,19 @@ static void handle_disconnected_notification(struct proxy_wifi_netdev_priv *priv
 
 static
 void handle_signal_quality_notification(struct proxy_wifi_netdev_priv *priv,
-					struct hv_wifi_msg message)
+					struct proxy_wifi_msg message)
 {
-	struct hv_wifi_signal_quality_notif *signal_notif = NULL;
+	struct proxy_wifi_signal_quality_notif *signal_notif = NULL;
 
 	netdev_dbg(priv->upperdev, "proxy_wifi: Handling a signal quality notification\n");
 
-	if (message.hdr.size != sizeof(struct hv_wifi_signal_quality_notif) ||
+	if (message.hdr.size != sizeof(struct proxy_wifi_signal_quality_notif) ||
 	    !message.body) {
 		netdev_err(priv->upperdev, "proxy_wifi: Invalid size for a signal quality notification: %d bytes\n",
 		       message.hdr.size);
 		return;
 	}
-	signal_notif = (struct hv_wifi_signal_quality_notif *)message.body;
+	signal_notif = (struct proxy_wifi_signal_quality_notif *)message.body;
 
 	write_lock(&proxy_wifi_connection_lock);
 	priv->connection.signal = signal_notif->signal;
@@ -497,9 +497,9 @@ static void receive_notification(struct proxy_wifi_netdev_priv *priv,
 				 struct socket *socket)
 {
 	int error = 0;
-	struct hv_wifi_msg message = {0};
+	struct proxy_wifi_msg message = {0};
 
-	error = receive_hv_wifi_message(socket, &message);
+	error = receive_proxy_wifi_message(socket, &message);
 	if (error < 0) {
 		netdev_err(priv->upperdev, "proxy_wifi: Failed to receive a notification, error %d\n",
 		       error);
@@ -961,7 +961,7 @@ static int proxy_wifi_scan(struct wiphy *wiphy,
 	return 0;
 }
 
-static int report_scanned_network(struct wiphy *wiphy, struct hv_wifi_bss *bss)
+static int report_scanned_network(struct wiphy *wiphy, struct proxy_wifi_bss *bss)
 {
 	struct cfg80211_bss *informed_bss = NULL;
 	const u64 tsf = div_u64(ktime_get_boottime_ns(), 1000);
@@ -985,8 +985,8 @@ static int report_scanned_network(struct wiphy *wiphy, struct hv_wifi_bss *bss)
 	return 0;
 }
 
-static bool is_bss_valid(const struct hv_wifi_bss *bss,
-			 const struct hv_wifi_msg *message)
+static bool is_bss_valid(const struct proxy_wifi_bss *bss,
+			 const struct proxy_wifi_msg *message)
 {
 	// Check the bss and its IEs are contained in the message body
 	return (u8 *)bss >= message->body &&
@@ -1003,9 +1003,9 @@ static void proxy_wifi_scan_result(struct work_struct *work)
 	struct proxy_wifi_netdev_priv *n_priv =
 				netdev_priv(w_priv->scan_request->wdev->netdev);
 	struct cfg80211_scan_info scan_info = { .aborted = false };
-	struct hv_wifi_msg message = {0};
-	struct hv_wifi_scan_response *scan_response = NULL;
-	struct hv_wifi_bss *bss = NULL;
+	struct proxy_wifi_msg message = {0};
+	struct proxy_wifi_scan_response *scan_response = NULL;
+	struct proxy_wifi_bss *bss = NULL;
 	int i = 0;
 
 	if (!w_priv->scan_request) {
@@ -1022,7 +1022,7 @@ static void proxy_wifi_scan_result(struct work_struct *work)
 		goto complete_scan;
 	}
 
-	scan_response = (struct hv_wifi_scan_response *)message.body;
+	scan_response = (struct proxy_wifi_scan_response *)message.body;
 
 	netdev_info(n_priv->upperdev, "proxy_wifi: Received %u scan results\n",
 	            scan_response->num_bss);
@@ -1064,9 +1064,9 @@ static void proxy_wifi_cancel_scan(struct wiphy *wiphy)
 }
 
 static int build_connect_request_context(struct cfg80211_connect_params *sme,
-					 struct hv_wifi_connect_request **connect_req_ctx)
+					 struct proxy_wifi_connect_request **connect_req_ctx)
 {
-	struct hv_wifi_connect_request *context = NULL;
+	struct proxy_wifi_connect_request *context = NULL;
 	u8 key_len = 0;
 	const u8 *key = NULL;
 
@@ -1160,8 +1160,8 @@ static void proxy_wifi_connect_complete(struct work_struct *work)
 	struct proxy_wifi_netdev_priv *priv =
 		container_of(work, struct proxy_wifi_netdev_priv, connect);
 	u16 status = WLAN_STATUS_UNSPECIFIED_FAILURE;
-	struct hv_wifi_connect_response *connect_response = NULL;
-	struct hv_wifi_msg message = {0};
+	struct proxy_wifi_connect_response *connect_response = NULL;
+	struct proxy_wifi_msg message = {0};
 	u8 connected_bssid[ETH_ALEN];
 
 	if (!priv->connect_req_ctx) {
@@ -1180,7 +1180,7 @@ static void proxy_wifi_connect_complete(struct work_struct *work)
 		goto complete_connect;
 	}
 
-	connect_response = (struct hv_wifi_connect_response *)message.body;
+	connect_response = (struct proxy_wifi_connect_response *)message.body;
 	status = connect_response->result_code;
 
 	netdev_info(priv->upperdev, "proxy_wifi: Connection result: %d, session id: %lld\n",
@@ -1266,7 +1266,7 @@ static void proxy_wifi_disconnect_complete(struct work_struct *work)
 {
 	struct proxy_wifi_netdev_priv *priv =
 		container_of(work, struct proxy_wifi_netdev_priv, disconnect);
-	struct hv_wifi_msg message = {0};
+	struct proxy_wifi_msg message = {0};
 	u64 session_id = 0;
 
 	read_lock(&proxy_wifi_connection_lock);
@@ -1644,8 +1644,8 @@ static int proxy_wifi_newlink(struct net *src_net, struct net_device *dev,
 	priv->connection.tx_packets = 0;
 	priv->connection.tx_failed = 0;
 
-	priv->request_port = HV_WIFI_REQUEST_PORT;
-	priv->notification_port = HV_WIFI_NOTIFICATION_PORT;
+	priv->request_port = PROXY_WIFI_REQUEST_PORT;
+	priv->notification_port = PROXY_WIFI_NOTIFICATION_PORT;
 
 	err = setup_notification_channel(priv, priv->notification_port);
 	if (err) {
