@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/* drivers/net/wireless/proxy_wifi.c
- *
+/*
  * An implementation of a cfg80211 driver that delegates control operations to a
  * proxy through a VSock. The data path is redirected to an ethernet net_device
  * similarly as in virt_wifi.
@@ -19,7 +18,7 @@
 #include <linux/skbuff.h>
 
 /* Single threaded workqueue to serialize all exchanges with the host */
-static struct workqueue_struct *proxy_wifi_command_wq = NULL;
+static struct workqueue_struct *proxy_wifi_command_wq;
 
 /* Ports must be in host byte order */
 #define PROXY_WIFI_REQUEST_PORT 12345
@@ -39,7 +38,7 @@ enum proxy_wifi_operation {
 };
 
 enum proxy_wifi_version {
-	Version_0_1 = 0x0001,
+	VERSION_0_1 = 0x0001,
 };
 
 struct proxy_wifi_hdr {
@@ -109,14 +108,15 @@ struct proxy_wifi_msg {
 	u8 *body;
 };
 
-static int build_scan_request_msg(struct proxy_wifi_msg *message,
-                                  const struct cfg80211_scan_request* scan_params)
+static int
+build_scan_request_msg(struct proxy_wifi_msg *message,
+		       const struct cfg80211_scan_request *scan_params)
 {
 	struct proxy_wifi_scan_request *scan_request = NULL;
 
 	message->hdr.operation = WIFI_OP_SCAN_REQUEST;
 	message->hdr.size = sizeof(struct proxy_wifi_scan_request);
-	message->hdr.version = Version_0_1;
+	message->hdr.version = VERSION_0_1;
 
 	message->body = kzalloc(message->hdr.size, GFP_KERNEL);
 	if (!message->body)
@@ -131,36 +131,38 @@ static int build_scan_request_msg(struct proxy_wifi_msg *message,
 	return 0;
 }
 
-static int build_connect_request_message(struct proxy_wifi_msg *message,
-					 const struct proxy_wifi_connect_request *connection_params)
+static int
+build_connect_request_msg(struct proxy_wifi_msg *message,
+			  const struct proxy_wifi_connect_request *conn_params)
 {
 	message->hdr.operation = WIFI_OP_CONNECT_REQUEST;
 	message->hdr.size = sizeof(struct proxy_wifi_connect_request) +
-			    connection_params->key_len;
-	message->hdr.version = Version_0_1;
+			    conn_params->key_len;
+	message->hdr.version = VERSION_0_1;
 
 	message->body = kzalloc(message->hdr.size, GFP_KERNEL);
 	if (!message->body)
 		return -ENOMEM;
 
-	memcpy(message->body, connection_params, message->hdr.size);
+	memcpy(message->body, conn_params, message->hdr.size);
 	return 0;
 }
 
-static int build_disconnect_request_message(struct proxy_wifi_msg *message,
-					    u64 session_id)
+static int build_disconnect_request_msg(struct proxy_wifi_msg *message,
+					u64 session_id)
 {
 	struct proxy_wifi_disconnect_request *disconnect_request = NULL;
 
 	message->hdr.operation = WIFI_OP_DISCONNECT_REQUEST;
 	message->hdr.size = sizeof(struct proxy_wifi_disconnect_request);
-	message->hdr.version = Version_0_1;
+	message->hdr.version = VERSION_0_1;
 
 	message->body = kzalloc(message->hdr.size, GFP_KERNEL);
 	if (!message->body)
 		return -ENOMEM;
 
-	disconnect_request = (struct proxy_wifi_disconnect_request *)message->body;
+	disconnect_request =
+		(struct proxy_wifi_disconnect_request *)message->body;
 	disconnect_request->session_id = session_id;
 
 	return 0;
@@ -171,15 +173,14 @@ static int receive_bytes(struct socket *socket, size_t expected_size,
 {
 	int return_code = 0;
 	size_t total_received = 0;
-	struct msghdr msg_header = {0};
+	struct msghdr msg_header = { 0 };
 	struct kvec iv = { .iov_len = expected_size, .iov_base = buffer };
 
 	while (total_received < expected_size) {
 		return_code = kernel_recvmsg(socket, &msg_header, &iv, 1,
 					     expected_size - total_received, 0);
-		if (return_code <= 0) {
+		if (return_code <= 0)
 			return return_code;
-		}
 
 		total_received += return_code;
 		if (total_received > expected_size)
@@ -193,16 +194,17 @@ static int receive_bytes(struct socket *socket, size_t expected_size,
 }
 
 static int receive_proxy_wifi_message(struct socket *socket,
-				   struct proxy_wifi_msg *message)
+				      struct proxy_wifi_msg *message)
 {
 	int error = 0;
 
-	error = receive_bytes(socket, sizeof(message->hdr), (u8 *)&message->hdr);
+	error = receive_bytes(socket, sizeof(message->hdr),
+			      (u8 *)&message->hdr);
 	if (error < 0)
 		return error;
 
 	pr_debug("proxy_wifi: Receiving a message (Operation: %d, %d bytes)",
-	       message->hdr.operation, message->hdr.size);
+		 message->hdr.operation, message->hdr.size);
 
 	kfree(message->body);
 	message->body = NULL;
@@ -217,8 +219,9 @@ static int receive_proxy_wifi_message(struct socket *socket,
 			goto out_free;
 	}
 
-	if (message->hdr.version != Version_0_1) {
-		pr_err("Receive message with unsupported version %d", message->hdr.version);
+	if (message->hdr.version != VERSION_0_1) {
+		pr_err("Receive message with unsupported version %d",
+		       message->hdr.version);
 		error = -EINVAL;
 		goto out_free;
 	}
@@ -235,7 +238,7 @@ static int send_bytes(struct socket *socket, size_t message_size, u8 *buffer)
 {
 	int return_code = 0;
 	size_t total_sent = 0;
-	struct msghdr msg_header = {0};
+	struct msghdr msg_header = { 0 };
 	struct kvec iv = { .iov_len = message_size, .iov_base = buffer };
 
 	while (total_sent < message_size) {
@@ -258,7 +261,7 @@ static int send_bytes(struct socket *socket, size_t message_size, u8 *buffer)
 }
 
 static int send_proxy_wifi_message(struct socket *socket,
-				struct proxy_wifi_msg *message)
+				   struct proxy_wifi_msg *message)
 {
 	int error = 0;
 
@@ -266,7 +269,7 @@ static int send_proxy_wifi_message(struct socket *socket,
 		return -EINVAL;
 
 	pr_debug("proxy_wifi: Sending a message (Operation: %d, %d bytes)",
-	       message->hdr.operation, message->hdr.size);
+		 message->hdr.operation, message->hdr.size);
 
 	error = send_bytes(socket, sizeof(message->hdr), (u8 *)&message->hdr);
 	if (error < 0)
@@ -291,14 +294,16 @@ static int query_host(struct proxy_wifi_msg *message, unsigned int port)
 
 	error = sock_create_kern(&init_net, AF_VSOCK, SOCK_STREAM, 0, &socket);
 	if (error != 0) {
-		pr_err("proxy_wifi: Failed to create a socket, error %d", error);
+		pr_err("proxy_wifi: Failed to create a socket, error %d",
+		       error);
 		return error;
 	}
 
-	error = kernel_connect(socket, (struct sockaddr *)&addr,
-			       sizeof(addr), 0);
+	error = kernel_connect(socket, (struct sockaddr *)&addr, sizeof(addr),
+			       0);
 	if (error != 0) {
-		pr_err("proxy_wifi: Failed to connect to the host, error %d", error);
+		pr_err("proxy_wifi: Failed to connect to the host, error %d",
+		       error);
 		goto out_sock_release;
 	}
 
@@ -310,7 +315,8 @@ static int query_host(struct proxy_wifi_msg *message, unsigned int port)
 
 	error = receive_proxy_wifi_message(socket, message);
 	if (error < 0) {
-		pr_err("proxy_wifi: Failed to receive an answer, error %d", error);
+		pr_err("proxy_wifi: Failed to receive an answer, error %d",
+		       error);
 		goto out_sock_release;
 	} else {
 		error = 0;
@@ -321,10 +327,12 @@ out_sock_release:
 	return error;
 }
 
-static struct proxy_wifi_msg scan_command(unsigned int port, const struct cfg80211_scan_request* scan_request)
+static struct proxy_wifi_msg
+scan_command(unsigned int port,
+	     const struct cfg80211_scan_request *scan_request)
 {
 	int error = 0;
-	struct proxy_wifi_msg message = {0};
+	struct proxy_wifi_msg message = { 0 };
 
 	pr_info("proxy_wifi: Sending SCAN request to host");
 
@@ -348,15 +356,16 @@ error:
 	return message;
 }
 
-static struct proxy_wifi_msg connect_command(unsigned int port,
-					  const struct proxy_wifi_connect_request *connection_params)
+static struct proxy_wifi_msg
+connect_command(unsigned int port,
+		const struct proxy_wifi_connect_request *connection_params)
 {
 	int error = 0;
-	struct proxy_wifi_msg message = {0};
+	struct proxy_wifi_msg message = { 0 };
 
 	pr_info("proxy_wifi: Sending CONNECT request to host");
 
-	error = build_connect_request_message(&message, connection_params);
+	error = build_connect_request_msg(&message, connection_params);
 
 	if (error != 0) {
 		pr_err("proxy_wifi: Failed to build a connect request message");
@@ -364,9 +373,8 @@ static struct proxy_wifi_msg connect_command(unsigned int port,
 	}
 
 	error = query_host(&message, port);
-	if (error != 0) {
+	if (error != 0)
 		goto error;
-	}
 
 	return message;
 
@@ -378,14 +386,15 @@ error:
 	return message;
 }
 
-static struct proxy_wifi_msg disconnect_command(unsigned int port, u64 session_id)
+static struct proxy_wifi_msg disconnect_command(unsigned int port,
+						u64 session_id)
 {
 	int error = 0;
-	struct proxy_wifi_msg message = {0};
+	struct proxy_wifi_msg message = { 0 };
 
 	pr_info("proxy_wifi: Sending DISCONNECT request to host");
 
-	error = build_disconnect_request_message(&message, session_id);
+	error = build_disconnect_request_msg(&message, session_id);
 
 	if (error != 0) {
 		pr_err("proxy_wifi: Failed to build a connect request message");
@@ -393,9 +402,8 @@ static struct proxy_wifi_msg disconnect_command(unsigned int port, u64 session_i
 	}
 
 	error = query_host(&message, port);
-	if (error != 0) {
+	if (error != 0)
 		goto error;
-	}
 
 	return message;
 
@@ -441,15 +449,17 @@ struct proxy_wifi_netdev_priv {
 };
 
 static void proxy_wifi_disconnect_finalize(struct net_device *netdev,
-					  u16 reason_code);
+					   u16 reason_code);
 
-static void handle_disconnected_notification(struct proxy_wifi_netdev_priv *priv,
-					     struct proxy_wifi_msg message)
+static void
+handle_disconnected_notification(struct proxy_wifi_netdev_priv *priv,
+				 struct proxy_wifi_msg message)
 {
 	struct proxy_wifi_disconnect_notif *disconnect_notif = NULL;
 	u64 session_id = 0;
 
-	netdev_info(priv->upperdev, "proxy_wifi: Handling a disconnected notification\n");
+	netdev_info(priv->upperdev,
+		    "proxy_wifi: Handling a disconnected notification\n");
 
 	if (message.hdr.size != sizeof(struct proxy_wifi_disconnect_notif))
 		netdev_warn(priv->upperdev,
@@ -472,18 +482,21 @@ static void handle_disconnected_notification(struct proxy_wifi_netdev_priv *priv
 	proxy_wifi_disconnect_finalize(priv->upperdev, WLAN_REASON_UNSPECIFIED);
 }
 
-static
-void handle_signal_quality_notification(struct proxy_wifi_netdev_priv *priv,
-					struct proxy_wifi_msg message)
+static void
+handle_signal_quality_notification(struct proxy_wifi_netdev_priv *priv,
+				   struct proxy_wifi_msg message)
 {
 	struct proxy_wifi_signal_quality_notif *signal_notif = NULL;
 
-	netdev_dbg(priv->upperdev, "proxy_wifi: Handling a signal quality notification\n");
+	netdev_dbg(priv->upperdev,
+		   "proxy_wifi: Handling a signal quality notification\n");
 
-	if (message.hdr.size != sizeof(struct proxy_wifi_signal_quality_notif) ||
+	if (message.hdr.size !=
+		    sizeof(struct proxy_wifi_signal_quality_notif) ||
 	    !message.body) {
-		netdev_err(priv->upperdev, "proxy_wifi: Invalid size for a signal quality notification: %d bytes\n",
-		       message.hdr.size);
+		netdev_err(priv->upperdev,
+			   "proxy_wifi: Invalid size for a signal quality notification: %d bytes\n",
+			   message.hdr.size);
 		return;
 	}
 	signal_notif = (struct proxy_wifi_signal_quality_notif *)message.body;
@@ -497,17 +510,18 @@ static void receive_notification(struct proxy_wifi_netdev_priv *priv,
 				 struct socket *socket)
 {
 	int error = 0;
-	struct proxy_wifi_msg message = {0};
+	struct proxy_wifi_msg message = { 0 };
 
 	error = receive_proxy_wifi_message(socket, &message);
 	if (error < 0) {
-		netdev_err(priv->upperdev, "proxy_wifi: Failed to receive a notification, error %d\n",
-		       error);
+		netdev_err(priv->upperdev,
+			   "proxy_wifi: Failed to receive a notification, error %d\n",
+			   error);
 		goto out_free;
 	}
 
 	netdev_dbg(priv->upperdev, "proxy_wifi: Got a notification, type %d\n",
-	       message.hdr.operation);
+		   message.hdr.operation);
 
 	// Dispatch the notification
 	if (message.hdr.operation == WIFI_NOTIF_DISCONNECTED)
@@ -515,7 +529,8 @@ static void receive_notification(struct proxy_wifi_netdev_priv *priv,
 	else if (message.hdr.operation == WIFI_NOTIF_SIGNAL_QUALITY)
 		handle_signal_quality_notification(priv, message);
 	else
-		netdev_warn(priv->upperdev, "proxy_wifi: Received an unknown notification\n");
+		netdev_warn(priv->upperdev,
+			    "proxy_wifi: Received an unknown notification\n");
 
 out_free:
 	kfree(message.body);
@@ -525,8 +540,10 @@ static void poll_notifications(struct work_struct *work)
 {
 	int error = 0;
 	struct socket *connect_socket = NULL;
-	struct proxy_wifi_netdev_priv *priv = container_of(work,
-		struct proxy_wifi_netdev_priv, notifications_work.work);
+	struct proxy_wifi_netdev_priv *priv =
+		container_of(work,
+			     struct proxy_wifi_netdev_priv,
+			     notifications_work.work);
 
 	for (;;) {
 		error = kernel_accept(priv->notification_socket,
@@ -535,8 +552,9 @@ static void poll_notifications(struct work_struct *work)
 			// We are done processing incoming notifications
 			break;
 		} else if (error != 0) {
-			netdev_err(priv->upperdev, "proxy_wifi: Failed to accept a connection, error %d",
-			       error);
+			netdev_err(priv->upperdev,
+				   "proxy_wifi: Failed to accept a connection, error %d",
+				   error);
 			break;
 		}
 
@@ -548,46 +566,52 @@ static void poll_notifications(struct work_struct *work)
 	}
 
 	// Re-arm the notification work
-	queue_delayed_work(proxy_wifi_command_wq, &priv->notifications_work, 10 * min(1, HZ / 1000));
+	queue_delayed_work(proxy_wifi_command_wq, &priv->notifications_work,
+			   10 * min(1, HZ / 1000));
 }
 
-static int setup_notification_channel(struct proxy_wifi_netdev_priv *netdev_priv,
-				      unsigned int port)
+static int
+setup_notification_channel(struct proxy_wifi_netdev_priv *netdev_priv,
+			   unsigned int port)
 {
 	int error = 0;
-	struct sockaddr_vm addr = {
-		.svm_family = AF_VSOCK,
-		.svm_port = port,
-		.svm_cid = VMADDR_CID_ANY
-	};
+	struct sockaddr_vm addr = { .svm_family = AF_VSOCK,
+				    .svm_port = port,
+				    .svm_cid = VMADDR_CID_ANY };
 
 	error = sock_create_kern(&init_net, AF_VSOCK, SOCK_STREAM, 0,
 				 &netdev_priv->notification_socket);
 	if (error != 0) {
-		netdev_err(netdev_priv->upperdev, "proxy_wifi: Failed to create the notification socket, error %d",
-		           error);
+		netdev_err(netdev_priv->upperdev,
+			   "proxy_wifi: Failed to create the notification socket, error %d",
+			   error);
 		return error;
 	}
 
 	error = kernel_bind(netdev_priv->notification_socket,
 			    (struct sockaddr *)&addr, sizeof(addr));
 	if (error != 0) {
-		netdev_err(netdev_priv->upperdev, "proxy_wifi: Failed to bind the notification socket, error %d",
-		           error);
+		netdev_err(netdev_priv->upperdev,
+			   "proxy_wifi: Failed to bind the notification socket, error %d",
+			   error);
 		goto out_release_sock;
 	}
 
 	error = kernel_listen(netdev_priv->notification_socket, INT_MAX);
 	if (error != 0) {
-		netdev_err(netdev_priv->upperdev, "proxy_wifi: Failed to listen on the notification socket, error %d",
-		           error);
+		netdev_err(netdev_priv->upperdev,
+			   "proxy_wifi: Failed to listen on the notification socket, error %d",
+			   error);
 		goto out_release_sock;
 	}
 
 	// Start the notification handling thread
 	INIT_DELAYED_WORK(&netdev_priv->notifications_work, poll_notifications);
-	if (!queue_delayed_work(proxy_wifi_command_wq, &netdev_priv->notifications_work, 10 * HZ / 1000)) {
-		netdev_err(netdev_priv->upperdev, "proxy_wifi: Failed to start the notification work");
+	if (!queue_delayed_work(proxy_wifi_command_wq,
+				&netdev_priv->notifications_work,
+				10 * HZ / 1000)) {
+		netdev_err(netdev_priv->upperdev,
+			   "proxy_wifi: Failed to start the notification work");
 		error = -EINVAL;
 		goto out_release_sock;
 	}
@@ -599,9 +623,11 @@ out_release_sock:
 	return error;
 }
 
-static void stop_notification_channel(struct proxy_wifi_netdev_priv *netdev_priv)
+static void
+stop_notification_channel(struct proxy_wifi_netdev_priv *netdev_priv)
 {
-	netdev_dbg(netdev_priv->upperdev, "proxy_wifi: Waiting for notification work completion...");
+	netdev_dbg(netdev_priv->upperdev,
+		   "proxy_wifi: Waiting for notification work completion...");
 	cancel_delayed_work_sync(&netdev_priv->notifications_work);
 
 	sock_release(netdev_priv->notification_socket);
@@ -619,46 +645,95 @@ struct proxy_wifi_wiphy_priv {
 };
 
 u32 cipher_suites[] = {
-	WLAN_CIPHER_SUITE_CCMP,
-	WLAN_CIPHER_SUITE_GCMP,
-	WLAN_CIPHER_SUITE_CCMP_256,
-	WLAN_CIPHER_SUITE_GCMP_256,
-	WLAN_CIPHER_SUITE_AES_CMAC,
-	WLAN_CIPHER_SUITE_BIP_GMAC_128,
-	WLAN_CIPHER_SUITE_BIP_CMAC_256,
-	WLAN_CIPHER_SUITE_BIP_GMAC_256
+	WLAN_CIPHER_SUITE_CCMP,		WLAN_CIPHER_SUITE_GCMP,
+	WLAN_CIPHER_SUITE_CCMP_256,	WLAN_CIPHER_SUITE_GCMP_256,
+	WLAN_CIPHER_SUITE_AES_CMAC,	WLAN_CIPHER_SUITE_BIP_GMAC_128,
+	WLAN_CIPHER_SUITE_BIP_CMAC_256, WLAN_CIPHER_SUITE_BIP_GMAC_256
 };
 
-u32 akm_suites[] = {
-	WLAN_AKM_SUITE_PSK,
-	WLAN_AKM_SUITE_SAE
-};
+u32 akm_suites[] = { WLAN_AKM_SUITE_PSK, WLAN_AKM_SUITE_SAE };
 
 static struct ieee80211_channel channels_2ghz[] = {
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2412, .max_power = 20, },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2417, .max_power = 20, },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2422, .max_power = 20, },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2427, .max_power = 20, },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2432, .max_power = 20, },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2437, .max_power = 20, },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2442, .max_power = 20, },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2447, .max_power = 20, },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2452, .max_power = 20, },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2457, .max_power = 20, },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2462, .max_power = 20, },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2467, .max_power = 20, },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2472, .max_power = 20, },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2477, .max_power = 20, },
-	{ .band = NL80211_BAND_2GHZ, .center_freq = 2484, .max_power = 20, },
+	{
+		.band = NL80211_BAND_2GHZ,
+		.center_freq = 2412,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_2GHZ,
+		.center_freq = 2417,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_2GHZ,
+		.center_freq = 2422,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_2GHZ,
+		.center_freq = 2427,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_2GHZ,
+		.center_freq = 2432,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_2GHZ,
+		.center_freq = 2437,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_2GHZ,
+		.center_freq = 2442,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_2GHZ,
+		.center_freq = 2447,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_2GHZ,
+		.center_freq = 2452,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_2GHZ,
+		.center_freq = 2457,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_2GHZ,
+		.center_freq = 2462,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_2GHZ,
+		.center_freq = 2467,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_2GHZ,
+		.center_freq = 2472,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_2GHZ,
+		.center_freq = 2477,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_2GHZ,
+		.center_freq = 2484,
+		.max_power = 20,
+	},
 };
 
 static struct ieee80211_rate bitrates_2ghz[] = {
-	{ .bitrate = 10 },
-	{ .bitrate = 20 },
-	{ .bitrate = 55 },
-	{ .bitrate = 110 },
-	{ .bitrate = 60 },
-	{ .bitrate = 120 },
+	{ .bitrate = 10 },  { .bitrate = 20 }, { .bitrate = 55 },
+	{ .bitrate = 110 }, { .bitrate = 60 }, { .bitrate = 120 },
 	{ .bitrate = 240 },
 };
 
@@ -685,62 +760,286 @@ static struct ieee80211_supported_band band_2ghz = {
 };
 
 static struct ieee80211_channel channels_5ghz[] = {
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5160, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5170, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5180, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5190, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5200, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5210, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5220, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5230, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5240, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5250, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5260, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5270, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5280, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5290, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5300, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5310, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5320, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5340, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5480, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5500, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5510, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5520, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5530, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5540, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5550, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5560, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5570, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5580, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5590, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5600, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5610, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5620, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5630, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5640, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5660, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5670, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5680, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5690, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5700, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5710, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5720, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5745, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5755, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5765, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5775, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5785, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5795, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5805, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5815, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5825, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5835, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5845, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5855, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5865, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5875, .max_power = 20, },
-	{ .band = NL80211_BAND_5GHZ, .center_freq = 5885, .max_power = 20, },
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5160,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5170,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5180,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5190,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5200,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5210,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5220,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5230,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5240,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5250,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5260,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5270,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5280,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5290,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5300,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5310,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5320,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5340,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5480,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5500,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5510,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5520,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5530,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5540,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5550,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5560,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5570,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5580,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5590,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5600,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5610,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5620,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5630,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5640,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5660,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5670,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5680,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5690,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5700,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5710,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5720,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5745,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5755,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5765,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5775,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5785,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5795,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5805,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5815,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5825,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5835,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5845,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5855,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5865,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5875,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_5GHZ,
+		.center_freq = 5885,
+		.max_power = 20,
+	},
 };
 
 static struct ieee80211_rate bitrates_5ghz[] = {
@@ -749,23 +1048,25 @@ static struct ieee80211_rate bitrates_5ghz[] = {
 	{ .bitrate = 240 },
 };
 
-#define RX_MCS_MAP (IEEE80211_VHT_MCS_SUPPORT_0_9 << 0 | \
-		    IEEE80211_VHT_MCS_SUPPORT_0_9 << 2 | \
-		    IEEE80211_VHT_MCS_SUPPORT_0_9 << 4 | \
-		    IEEE80211_VHT_MCS_SUPPORT_0_9 << 6 | \
-		    IEEE80211_VHT_MCS_SUPPORT_0_9 << 8 | \
-		    IEEE80211_VHT_MCS_SUPPORT_0_9 << 10 | \
-		    IEEE80211_VHT_MCS_SUPPORT_0_9 << 12 | \
-		    IEEE80211_VHT_MCS_SUPPORT_0_9 << 14)
+#define RX_MCS_MAP                                                             \
+	(IEEE80211_VHT_MCS_SUPPORT_0_9 << 0 |                                  \
+	 IEEE80211_VHT_MCS_SUPPORT_0_9 << 2 |                                  \
+	 IEEE80211_VHT_MCS_SUPPORT_0_9 << 4 |                                  \
+	 IEEE80211_VHT_MCS_SUPPORT_0_9 << 6 |                                  \
+	 IEEE80211_VHT_MCS_SUPPORT_0_9 << 8 |                                  \
+	 IEEE80211_VHT_MCS_SUPPORT_0_9 << 10 |                                 \
+	 IEEE80211_VHT_MCS_SUPPORT_0_9 << 12 |                                 \
+	 IEEE80211_VHT_MCS_SUPPORT_0_9 << 14)
 
-#define TX_MCS_MAP (IEEE80211_VHT_MCS_SUPPORT_0_9 << 0 | \
-		    IEEE80211_VHT_MCS_SUPPORT_0_9 << 2 | \
-		    IEEE80211_VHT_MCS_SUPPORT_0_9 << 4 | \
-		    IEEE80211_VHT_MCS_SUPPORT_0_9 << 6 | \
-		    IEEE80211_VHT_MCS_SUPPORT_0_9 << 8 | \
-		    IEEE80211_VHT_MCS_SUPPORT_0_9 << 10 | \
-		    IEEE80211_VHT_MCS_SUPPORT_0_9 << 12 | \
-		    IEEE80211_VHT_MCS_SUPPORT_0_9 << 14)
+#define TX_MCS_MAP                                                             \
+	(IEEE80211_VHT_MCS_SUPPORT_0_9 << 0 |                                  \
+	 IEEE80211_VHT_MCS_SUPPORT_0_9 << 2 |                                  \
+	 IEEE80211_VHT_MCS_SUPPORT_0_9 << 4 |                                  \
+	 IEEE80211_VHT_MCS_SUPPORT_0_9 << 6 |                                  \
+	 IEEE80211_VHT_MCS_SUPPORT_0_9 << 8 |                                  \
+	 IEEE80211_VHT_MCS_SUPPORT_0_9 << 10 |                                 \
+	 IEEE80211_VHT_MCS_SUPPORT_0_9 << 12 |                                 \
+	 IEEE80211_VHT_MCS_SUPPORT_0_9 << 14)
 
 static struct ieee80211_supported_band band_5ghz = {
 	.channels = channels_5ghz,
@@ -808,76 +1109,307 @@ static struct ieee80211_supported_band band_5ghz = {
 };
 
 static struct ieee80211_channel channels_6ghz[] = {
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 5955, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 5975, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 5995, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6015, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6035, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6055, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6075, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6095, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6115, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6135, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6155, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6175, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6195, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6215, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6235, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6255, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6275, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6295, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6315, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6335, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6355, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6375, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6395, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6415, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6435, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6455, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6475, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6495, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6515, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6535, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6555, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6575, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6595, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6615, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6635, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6655, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6675, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6695, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6715, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6735, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6755, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6775, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6795, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6815, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6835, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6855, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6875, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6895, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6915, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6935, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6955, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6975, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 6995, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 7015, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 7035, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 7055, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 7075, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 7095, .max_power = 20, },
-	{ .band = NL80211_BAND_6GHZ, .center_freq = 7115, .max_power = 20, },
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 5955,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 5975,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 5995,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6015,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6035,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6055,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6075,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6095,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6115,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6135,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6155,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6175,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6195,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6215,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6235,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6255,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6275,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6295,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6315,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6335,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6355,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6375,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6395,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6415,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6435,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6455,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6475,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6495,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6515,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6535,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6555,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6575,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6595,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6615,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6635,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6655,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6675,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6695,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6715,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6735,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6755,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6775,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6795,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6815,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6835,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6855,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6875,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6895,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6915,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6935,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6955,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6975,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 6995,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 7015,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 7035,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 7055,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 7075,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 7095,
+		.max_power = 20,
+	},
+	{
+		.band = NL80211_BAND_6GHZ,
+		.center_freq = 7115,
+		.max_power = 20,
+	},
 };
 
 static struct ieee80211_rate bitrates_6ghz[] = {
-	{ .bitrate = 60 },
-	{ .bitrate = 90 },
-	{ .bitrate = 120 },
-	{ .bitrate = 180 },
-	{ .bitrate = 240 },
-	{ .bitrate = 360 },
-	{ .bitrate = 480 },
-	{ .bitrate = 540 },
+	{ .bitrate = 60 },  { .bitrate = 90 },	{ .bitrate = 120 },
+	{ .bitrate = 180 }, { .bitrate = 240 }, { .bitrate = 360 },
+	{ .bitrate = 480 }, { .bitrate = 540 },
 };
 
 // Taken from mac80211_hwsim.
@@ -945,7 +1477,7 @@ static struct ieee80211_supported_band band_6ghz = {
 
 /* Called with the rtnl lock held. */
 static int proxy_wifi_scan(struct wiphy *wiphy,
-			  struct cfg80211_scan_request *request)
+			   struct cfg80211_scan_request *request)
 {
 	struct proxy_wifi_wiphy_priv *priv = wiphy_priv(wiphy);
 
@@ -961,7 +1493,8 @@ static int proxy_wifi_scan(struct wiphy *wiphy,
 	return 0;
 }
 
-static int report_scanned_network(struct wiphy *wiphy, struct proxy_wifi_bss *bss)
+static int report_scanned_network(struct wiphy *wiphy,
+				  struct proxy_wifi_bss *bss)
 {
 	struct cfg80211_bss *informed_bss = NULL;
 	const u64 tsf = div_u64(ktime_get_boottime_ns(), 1000);
@@ -969,17 +1502,19 @@ static int report_scanned_network(struct wiphy *wiphy, struct proxy_wifi_bss *bs
 
 	channel = ieee80211_get_channel_khz(wiphy, bss->channel_center_freq);
 	if (!channel) {
-		dev_warn(&wiphy->dev, "proxy_wifi: Unsupported frequency %d, ignoring scan result\n",
-		         bss->channel_center_freq);
+		dev_warn(&wiphy->dev,
+			 "proxy_wifi: Unsupported frequency %d, ignoring scan result\n",
+			 bss->channel_center_freq);
 		return -EINVAL;
 	}
 
-	informed_bss = cfg80211_inform_bss(wiphy, channel, CFG80211_BSS_FTYPE_PRESP,
-					   bss->bssid, tsf, bss->capabilities,
-					   bss->beacon_interval, (u8 *)bss + bss->ie_offset,
-					   bss->ie_size,
-					   bss->rssi * 100, /* rssi expected in mBm */
-					   GFP_KERNEL);
+	informed_bss =
+		cfg80211_inform_bss(wiphy, channel, CFG80211_BSS_FTYPE_PRESP,
+				    bss->bssid, tsf, bss->capabilities,
+				    bss->beacon_interval,
+				    (u8 *)bss + bss->ie_offset, bss->ie_size,
+				    bss->rssi * 100, /* rssi expected in mBm */
+				    GFP_KERNEL);
 
 	cfg80211_put_bss(wiphy, informed_bss);
 	return 0;
@@ -991,7 +1526,7 @@ static bool is_bss_valid(const struct proxy_wifi_bss *bss,
 	// Check the bss and its IEs are contained in the message body
 	return (u8 *)bss >= message->body &&
 	       (u8 *)bss + bss->ie_offset + bss->ie_size <=
-			(u8 *)message->body + message->hdr.size;
+		       (u8 *)message->body + message->hdr.size;
 }
 
 /* Acquires and releases the rdev BSS lock. */
@@ -1001,23 +1536,25 @@ static void proxy_wifi_scan_result(struct work_struct *work)
 		container_of(work, struct proxy_wifi_wiphy_priv, scan_result);
 	struct wiphy *wiphy = priv_to_wiphy(w_priv);
 	struct proxy_wifi_netdev_priv *n_priv =
-				netdev_priv(w_priv->scan_request->wdev->netdev);
+		netdev_priv(w_priv->scan_request->wdev->netdev);
 	struct cfg80211_scan_info scan_info = { .aborted = false };
-	struct proxy_wifi_msg message = {0};
+	struct proxy_wifi_msg message = { 0 };
 	struct proxy_wifi_scan_response *scan_response = NULL;
 	struct proxy_wifi_bss *bss = NULL;
 	int i = 0;
 
 	if (!w_priv->scan_request) {
-		netdev_err(n_priv->upperdev, "proxy_wifi: No scan parameters for a scan request\n");
+		netdev_err(n_priv->upperdev,
+			   "proxy_wifi: No scan parameters for a scan request\n");
 		scan_info.aborted = true;
 		goto complete_scan;
 	}
 
 	message = scan_command(n_priv->request_port, w_priv->scan_request);
 	if (message.hdr.operation != WIFI_OP_SCAN_RESPONSE) {
-		netdev_err(n_priv->upperdev, "proxy_wifi: Invalid scan response (Operation: %d)\n",
-		           message.hdr.operation);
+		netdev_err(n_priv->upperdev,
+			   "proxy_wifi: Invalid scan response (Operation: %d)\n",
+			   message.hdr.operation);
 		scan_info.aborted = true;
 		goto complete_scan;
 	}
@@ -1025,13 +1562,14 @@ static void proxy_wifi_scan_result(struct work_struct *work)
 	scan_response = (struct proxy_wifi_scan_response *)message.body;
 
 	netdev_info(n_priv->upperdev, "proxy_wifi: Received %u scan results\n",
-	            scan_response->num_bss);
+		    scan_response->num_bss);
 
 	for (i = 0; i < scan_response->num_bss; i++) {
 		bss = &scan_response->bss[i];
 		if (!is_bss_valid(bss, &message)) {
-			netdev_warn(n_priv->upperdev, "proxy_wifi: Ignoring an invalid scan result (Index %d)",
-			            i);
+			netdev_warn(n_priv->upperdev,
+				    "proxy_wifi: Ignoring an invalid scan result (Index %d)",
+				    i);
 			continue;
 		}
 
@@ -1063,8 +1601,9 @@ static void proxy_wifi_cancel_scan(struct wiphy *wiphy)
 	}
 }
 
-static int build_connect_request_context(struct cfg80211_connect_params *sme,
-					 struct proxy_wifi_connect_request **connect_req_ctx)
+static int
+build_connect_request_cxt(struct cfg80211_connect_params *sme,
+			  struct proxy_wifi_connect_request **connect_req_ctx)
 {
 	struct proxy_wifi_connect_request *context = NULL;
 	u8 key_len = 0;
@@ -1107,7 +1646,8 @@ static int build_connect_request_context(struct cfg80211_connect_params *sme,
 
 	context->num_pairwise_cipher_suites = sme->crypto.n_ciphers_pairwise;
 	memcpy(context->pairwise_cipher_suites, sme->crypto.ciphers_pairwise,
-	       sme->crypto.n_ciphers_pairwise * sizeof(sme->crypto.ciphers_pairwise[0]));
+	       sme->crypto.n_ciphers_pairwise *
+		       sizeof(sme->crypto.ciphers_pairwise[0]));
 
 	context->group_cipher_suite = sme->crypto.cipher_group;
 	context->key_len = key_len;
@@ -1120,7 +1660,7 @@ static int build_connect_request_context(struct cfg80211_connect_params *sme,
 /* Called with the rtnl lock held. */
 /* Acquires and releases proxy_wifi_connection_lock. */
 static int proxy_wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
-			     struct cfg80211_connect_params *sme)
+			      struct cfg80211_connect_params *sme)
 {
 	int error = 0;
 	struct proxy_wifi_netdev_priv *priv = netdev_priv(netdev);
@@ -1132,10 +1672,11 @@ static int proxy_wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 
 	kfree(priv->connect_req_ctx);
 	priv->connect_req_ctx = NULL;
-	error = build_connect_request_context(sme, &priv->connect_req_ctx);
+	error = build_connect_request_cxt(sme, &priv->connect_req_ctx);
 	if (error < 0) {
-		wiphy_err(wiphy, "proxy_wifi: Failed to build the connect request context: %d\n",
-		           error);
+		wiphy_err(wiphy,
+			  "proxy_wifi: Failed to build the connect request context: %d\n",
+			  error);
 		return error;
 	}
 
@@ -1161,11 +1702,12 @@ static void proxy_wifi_connect_complete(struct work_struct *work)
 		container_of(work, struct proxy_wifi_netdev_priv, connect);
 	u16 status = WLAN_STATUS_UNSPECIFIED_FAILURE;
 	struct proxy_wifi_connect_response *connect_response = NULL;
-	struct proxy_wifi_msg message = {0};
+	struct proxy_wifi_msg message = { 0 };
 	u8 connected_bssid[ETH_ALEN];
 
 	if (!priv->connect_req_ctx) {
-		netdev_err(priv->upperdev, "proxy_wifi: No connection parameters for a connection request\n");
+		netdev_err(priv->upperdev,
+			   "proxy_wifi: No connection parameters for a connection request\n");
 		goto complete_connect;
 	}
 
@@ -1175,16 +1717,18 @@ static void proxy_wifi_connect_complete(struct work_struct *work)
 	message = connect_command(priv->request_port, priv->connect_req_ctx);
 
 	if (message.hdr.operation != WIFI_OP_CONNECT_RESPONSE) {
-		netdev_err(priv->upperdev, "proxy_wifi: Invalid connect response (Operation: %d)\n",
-		           message.hdr.operation);
+		netdev_err(priv->upperdev,
+			   "proxy_wifi: Invalid connect response (Operation: %d)\n",
+			   message.hdr.operation);
 		goto complete_connect;
 	}
 
 	connect_response = (struct proxy_wifi_connect_response *)message.body;
 	status = connect_response->result_code;
 
-	netdev_info(priv->upperdev, "proxy_wifi: Connection result: %d, session id: %lld\n",
-	            status, connect_response->session_id);
+	netdev_info(priv->upperdev,
+		    "proxy_wifi: Connection result: %d, session id: %lld\n",
+		    status, connect_response->session_id);
 
 	if (status == WLAN_STATUS_SUCCESS) {
 		/* Set the current connection information */
@@ -1222,7 +1766,7 @@ complete_connect:
 /* May acquire and release proxy_wifi_connection_lock */
 static void proxy_wifi_cancel_connect(struct net_device *netdev)
 {
-	u8 bssid[ETH_ALEN] = {0};
+	u8 bssid[ETH_ALEN] = { 0 };
 	struct proxy_wifi_netdev_priv *priv = netdev_priv(netdev);
 
 	/* If there is work pending, clean up dangling callbacks. */
@@ -1244,7 +1788,7 @@ static void proxy_wifi_cancel_connect(struct net_device *netdev)
 /* Subcall acquires the rdev event lock. */
 /* Acquires and releases proxy_wifi_connection_lock */
 static void proxy_wifi_disconnect_finalize(struct net_device *netdev,
-					  u16 reason_code)
+					   u16 reason_code)
 {
 	struct proxy_wifi_netdev_priv *priv = netdev_priv(netdev);
 	bool is_connected = false;
@@ -1255,7 +1799,8 @@ static void proxy_wifi_disconnect_finalize(struct net_device *netdev,
 	write_unlock(&proxy_wifi_connection_lock);
 
 	if (is_connected) {
-		cfg80211_disconnected(netdev, reason_code, NULL, 0, true, GFP_KERNEL);
+		cfg80211_disconnected(netdev, reason_code, NULL, 0, true,
+				      GFP_KERNEL);
 		netif_carrier_off(netdev);
 	}
 }
@@ -1266,7 +1811,7 @@ static void proxy_wifi_disconnect_complete(struct work_struct *work)
 {
 	struct proxy_wifi_netdev_priv *priv =
 		container_of(work, struct proxy_wifi_netdev_priv, disconnect);
-	struct proxy_wifi_msg message = {0};
+	struct proxy_wifi_msg message = { 0 };
 	u64 session_id = 0;
 
 	read_lock(&proxy_wifi_connection_lock);
@@ -1275,13 +1820,14 @@ static void proxy_wifi_disconnect_complete(struct work_struct *work)
 
 	message = disconnect_command(priv->request_port, session_id);
 
-	netdev_info(priv->upperdev, "proxy_wifi: Disconnected, session id %lld\n",
-	            session_id);
+	netdev_info(priv->upperdev,
+		    "proxy_wifi: Disconnected, session id %lld\n", session_id);
 
 	/* Still complete the disconnection on error */
 	if (message.hdr.operation != WIFI_OP_DISCONNECT_RESPONSE)
-		netdev_err(priv->upperdev, "proxy_wifi: Expected WIFI_OP_DISCONNECT_RESPONSE, got: %d",
-		       message.hdr.operation);
+		netdev_err(priv->upperdev,
+			   "proxy_wifi: Expected WIFI_OP_DISCONNECT_RESPONSE, got: %d",
+			   message.hdr.operation);
 
 	proxy_wifi_disconnect_finalize(priv->upperdev, WLAN_REASON_UNSPECIFIED);
 
@@ -1292,7 +1838,7 @@ static void proxy_wifi_disconnect_complete(struct work_struct *work)
 /* Subcall acquires and releases the rdev event lock. */
 /* Subcall acquires and releases proxy_wifi_connection_lock. */
 static int proxy_wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev,
-				u16 reason_code)
+				 u16 reason_code)
 {
 	struct proxy_wifi_netdev_priv *priv = netdev_priv(netdev);
 	bool is_connected = false;
@@ -1320,7 +1866,7 @@ static int proxy_wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 /* Called with the rtnl lock held. */
 /* Acquires and releases proxy_wifi_connection_lock. */
 static int proxy_wifi_get_station(struct wiphy *wiphy, struct net_device *dev,
-				 const u8 *mac, struct station_info *sinfo)
+				  const u8 *mac, struct station_info *sinfo)
 {
 	int error = 0;
 	struct proxy_wifi_netdev_priv *priv = netdev_priv(dev);
@@ -1340,14 +1886,14 @@ static int proxy_wifi_get_station(struct wiphy *wiphy, struct net_device *dev,
 	}
 
 	sinfo->filled = BIT_ULL(NL80211_STA_INFO_TX_PACKETS) |
-		BIT_ULL(NL80211_STA_INFO_TX_FAILED) |
-		BIT_ULL(NL80211_STA_INFO_SIGNAL) |
-		BIT_ULL(NL80211_STA_INFO_TX_BITRATE);
+			BIT_ULL(NL80211_STA_INFO_TX_FAILED) |
+			BIT_ULL(NL80211_STA_INFO_SIGNAL) |
+			BIT_ULL(NL80211_STA_INFO_TX_BITRATE);
 	sinfo->tx_packets = priv->connection.tx_packets;
 	sinfo->tx_failed = priv->connection.tx_failed;
 	/* For CFG80211_SIGNAL_TYPE_MBM, value is expressed in _dBm_ */
 	sinfo->signal = priv->connection.signal;
-	sinfo->txrate = (struct rate_info) {
+	sinfo->txrate = (struct rate_info){
 		.legacy = 10, /* units are 100kbit/s */
 	};
 
@@ -1359,7 +1905,7 @@ out_unlock:
 /* Called with the rtnl lock held. */
 /* Acquires and releases proxy_wifi_connection_lock. */
 static int proxy_wifi_dump_station(struct wiphy *wiphy, struct net_device *dev,
-				  int idx, u8 *mac, struct station_info *sinfo)
+				   int idx, u8 *mac, struct station_info *sinfo)
 {
 	struct proxy_wifi_netdev_priv *priv = netdev_priv(dev);
 	bool is_connected = false;
@@ -1415,7 +1961,8 @@ static struct wiphy *proxy_wifi_make_wiphy(void)
 	wiphy->n_cipher_suites = ARRAY_SIZE(cipher_suites);
 
 	// Offload handshakes (the host take care of it)
-	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_4WAY_HANDSHAKE_STA_PSK);
+	wiphy_ext_feature_set(wiphy,
+			      NL80211_EXT_FEATURE_4WAY_HANDSHAKE_STA_PSK);
 
 	// TODO guhetier: Enable or remove depending on if we can get SAE offload
 	// wiphy->features |= NL80211_FEATURE_SAE;
@@ -1456,7 +2003,7 @@ static void proxy_wifi_destroy_wiphy(struct wiphy *wiphy)
 /* Enters and exits a RCU-bh critical section. */
 /* Aquires and releases proxy_wifi_connection_lock. */
 static netdev_tx_t proxy_wifi_start_xmit(struct sk_buff *skb,
-					struct net_device *dev)
+					 struct net_device *dev)
 {
 	bool is_connected = false;
 	struct proxy_wifi_netdev_priv *priv = netdev_priv(dev);
@@ -1513,8 +2060,8 @@ static int proxy_wifi_net_device_get_iflink(const struct net_device *dev)
 
 static const struct net_device_ops proxy_wifi_ops = {
 	.ndo_start_xmit = proxy_wifi_start_xmit,
-	.ndo_open	= proxy_wifi_net_device_open,
-	.ndo_stop	= proxy_wifi_net_device_stop,
+	.ndo_open = proxy_wifi_net_device_open,
+	.ndo_stop = proxy_wifi_net_device_stop,
 	.ndo_get_iflink = proxy_wifi_net_device_get_iflink,
 };
 
@@ -1555,7 +2102,8 @@ static rx_handler_result_t proxy_wifi_rx_handler(struct sk_buff **pskb)
 	/* GFP_ATOMIC because this is a packet interrupt handler. */
 	skb = skb_share_check(skb, GFP_ATOMIC);
 	if (!skb) {
-		dev_err(&priv->upperdev->dev, "proxy_wifi: Can't skb_share_check\n");
+		dev_err(&priv->upperdev->dev,
+			"proxy_wifi: Can't skb_share_check\n");
 		return RX_HANDLER_CONSUMED;
 	}
 
@@ -1567,8 +2115,8 @@ static rx_handler_result_t proxy_wifi_rx_handler(struct sk_buff **pskb)
 
 /* Called with rtnl lock held. */
 static int proxy_wifi_newlink(struct net *src_net, struct net_device *dev,
-			     struct nlattr *tb[], struct nlattr *data[],
-			     struct netlink_ext_ack *extack)
+			      struct nlattr *tb[], struct nlattr *data[],
+			      struct netlink_ext_ack *extack)
 {
 	struct proxy_wifi_netdev_priv *priv = netdev_priv(dev);
 	int err;
@@ -1581,8 +2129,8 @@ static int proxy_wifi_newlink(struct net *src_net, struct net_device *dev,
 	netif_carrier_off(dev);
 
 	priv->upperdev = dev;
-	priv->lowerdev = __dev_get_by_index(src_net,
-					    nla_get_u32(tb[IFLA_LINK]));
+	priv->lowerdev =
+		__dev_get_by_index(src_net, nla_get_u32(tb[IFLA_LINK]));
 
 	if (!priv->lowerdev)
 		return -ENODEV;
@@ -1671,8 +2219,7 @@ remove_handler:
 }
 
 /* Called with rtnl lock held. */
-static void proxy_wifi_dellink(struct net_device *dev,
-			      struct list_head *head)
+static void proxy_wifi_dellink(struct net_device *dev, struct list_head *head)
 {
 	struct proxy_wifi_netdev_priv *priv = netdev_priv(dev);
 
@@ -1703,11 +2250,11 @@ static void proxy_wifi_dellink(struct net_device *dev,
 }
 
 static struct rtnl_link_ops proxy_wifi_link_ops = {
-	.kind		= "proxy_wifi",
-	.setup		= proxy_wifi_setup,
-	.newlink	= proxy_wifi_newlink,
-	.dellink	= proxy_wifi_dellink,
-	.priv_size	= sizeof(struct proxy_wifi_netdev_priv),
+	.kind = "proxy_wifi",
+	.setup = proxy_wifi_setup,
+	.newlink = proxy_wifi_newlink,
+	.dellink = proxy_wifi_dellink,
+	.priv_size = sizeof(struct proxy_wifi_netdev_priv),
 };
 
 static bool netif_is_proxy_wifi_dev(const struct net_device *dev)
@@ -1716,7 +2263,7 @@ static bool netif_is_proxy_wifi_dev(const struct net_device *dev)
 }
 
 static int proxy_wifi_event(struct notifier_block *this, unsigned long event,
-			   void *ptr)
+			    void *ptr)
 {
 	struct net_device *lower_dev = netdev_notifier_info_to_dev(ptr);
 	struct proxy_wifi_netdev_priv *priv;
