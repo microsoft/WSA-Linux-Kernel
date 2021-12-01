@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
-/* drivers/net/wireless/virt_wifi.c
+/* drivers/net/wireless/proxy_wifi.c
  *
- * A fake implementation of cfg80211_ops that can be tacked on to an ethernet
- * net_device to make it appear as a wireless connection.
+ * An implementation of a cfg80211 driver that delegates control operations to a
+ * proxy through a VSock. The data path is redirected to an ethernet net_device
+ * similarly as in virt_wifi.
  *
- * Copyright (C) 2018 Google, Inc.
- *
- * Author: schuffelen@google.com
+ * Author: guhetier@microsoft.com
  */
 
 #include <net/cfg80211.h>
@@ -1704,7 +1703,7 @@ static void virt_wifi_dellink(struct net_device *dev,
 }
 
 static struct rtnl_link_ops virt_wifi_link_ops = {
-	.kind		= "virt_wifi",
+	.kind		= "proxy_wifi",
 	.setup		= virt_wifi_setup,
 	.newlink	= virt_wifi_newlink,
 	.dellink	= virt_wifi_dellink,
@@ -1763,7 +1762,7 @@ static int __init virt_wifi_init_module(void)
 {
 	int err;
 
-	virt_wifi_command_wq = create_singlethread_workqueue("virt_wifi");
+	virt_wifi_command_wq = create_singlethread_workqueue("proxy_wifi");
 	if (!virt_wifi_command_wq) {
 		pr_err("Failed creating work queue\n");
 		return -EINVAL;
@@ -1806,6 +1805,6 @@ module_init(virt_wifi_init_module);
 module_exit(virt_wifi_cleanup_module);
 
 MODULE_LICENSE("GPL v2");
-MODULE_AUTHOR("Cody Schuffelen <schuffelen@google.com>");
+MODULE_AUTHOR("Guillaume Hetier <guhetier@microsoft.com>");
 MODULE_DESCRIPTION("Driver for a wireless wrapper of ethernet devices");
-MODULE_ALIAS_RTNL_LINK("virt_wifi");
+MODULE_ALIAS_RTNL_LINK("proxy_wifi");
