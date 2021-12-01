@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
+ * Copyright (c) Microsoft Corporation.
+ *
  * An implementation of a cfg80211 driver that delegates control operations to a
  * proxy through a VSock. The data path is redirected to an ethernet net_device
  * similarly as in virt_wifi.
