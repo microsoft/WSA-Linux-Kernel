@@ -19,7 +19,7 @@
 #include <linux/skbuff.h>
 
 /* Single threaded workqueue to serialize all exchanges with the host */
-static struct workqueue_struct *virt_wifi_command_wq = NULL;
+static struct workqueue_struct *proxy_wifi_command_wq = NULL;
 
 /* Ports must be in host byte order */
 #define HV_WIFI_REQUEST_PORT 12345
@@ -201,7 +201,7 @@ static int receive_hv_wifi_message(struct socket *socket,
 	if (error < 0)
 		return error;
 
-	pr_debug("virt_wifi: Receiving a message (Operation: %d, %d bytes)",
+	pr_debug("proxy_wifi: Receiving a message (Operation: %d, %d bytes)",
 	       message->hdr.operation, message->hdr.size);
 
 	kfree(message->body);
@@ -265,7 +265,7 @@ static int send_hv_wifi_message(struct socket *socket,
 	if (!message->body && message->hdr.size != 0)
 		return -EINVAL;
 
-	pr_debug("virt_wifi: Sending a message (Operation: %d, %d bytes)",
+	pr_debug("proxy_wifi: Sending a message (Operation: %d, %d bytes)",
 	       message->hdr.operation, message->hdr.size);
 
 	error = send_bytes(socket, sizeof(message->hdr), (u8 *)&message->hdr);
@@ -291,26 +291,26 @@ static int query_host(struct hv_wifi_msg *message, unsigned int port)
 
 	error = sock_create_kern(&init_net, AF_VSOCK, SOCK_STREAM, 0, &socket);
 	if (error != 0) {
-		pr_err("virt_wifi: Failed to create a socket, error %d", error);
+		pr_err("proxy_wifi: Failed to create a socket, error %d", error);
 		return error;
 	}
 
 	error = kernel_connect(socket, (struct sockaddr *)&addr,
 			       sizeof(addr), 0);
 	if (error != 0) {
-		pr_err("virt_wifi: Failed to connect to the host, error %d", error);
+		pr_err("proxy_wifi: Failed to connect to the host, error %d", error);
 		goto out_sock_release;
 	}
 
 	error = send_hv_wifi_message(socket, message);
 	if (error < 0) {
-		pr_err("virt_wifi: Failed to send message, error %d", error);
+		pr_err("proxy_wifi: Failed to send message, error %d", error);
 		goto out_sock_release;
 	}
 
 	error = receive_hv_wifi_message(socket, message);
 	if (error < 0) {
-		pr_err("virt_wifi: Failed to receive an answer, error %d", error);
+		pr_err("proxy_wifi: Failed to receive an answer, error %d", error);
 		goto out_sock_release;
 	} else {
 		error = 0;
@@ -326,11 +326,11 @@ static struct hv_wifi_msg scan_command(unsigned int port, const struct cfg80211_
 	int error = 0;
 	struct hv_wifi_msg message = {0};
 
-	pr_info("virt_wifi: Sending SCAN request to host");
+	pr_info("proxy_wifi: Sending SCAN request to host");
 
 	error = build_scan_request_msg(&message, scan_request);
 	if (error != 0) {
-		pr_err("virt_wifi: Failed to build a scan request");
+		pr_err("proxy_wifi: Failed to build a scan request");
 		goto error;
 	}
 
@@ -354,12 +354,12 @@ static struct hv_wifi_msg connect_command(unsigned int port,
 	int error = 0;
 	struct hv_wifi_msg message = {0};
 
-	pr_info("virt_wifi: Sending CONNECT request to host");
+	pr_info("proxy_wifi: Sending CONNECT request to host");
 
 	error = build_connect_request_message(&message, connection_params);
 
 	if (error != 0) {
-		pr_err("virt_wifi: Failed to build a connect request message");
+		pr_err("proxy_wifi: Failed to build a connect request message");
 		goto error;
 	}
 
@@ -383,12 +383,12 @@ static struct hv_wifi_msg disconnect_command(unsigned int port, u64 session_id)
 	int error = 0;
 	struct hv_wifi_msg message = {0};
 
-	pr_info("virt_wifi: Sending DISCONNECT request to host");
+	pr_info("proxy_wifi: Sending DISCONNECT request to host");
 
 	error = build_disconnect_request_message(&message, session_id);
 
 	if (error != 0) {
-		pr_err("virt_wifi: Failed to build a connect request message");
+		pr_err("proxy_wifi: Failed to build a connect request message");
 		goto error;
 	}
 
@@ -410,19 +410,19 @@ error:
 struct connection_state {
 	u32 tx_packets;
 	u32 tx_failed;
-	/* Protected by `virt_wifi_connection_lock` */
+	/* Protected by `proxy_wifi_connection_lock` */
 	u8 bssid[ETH_ALEN];
-	/* Protected by `virt_wifi_connection_lock` */
+	/* Protected by `proxy_wifi_connection_lock` */
 	bool is_connected;
-	/* Protected by `virt_wifi_connection_lock` */
+	/* Protected by `proxy_wifi_connection_lock` */
 	s8 signal;
-	/* Protected by `virt_wifi_connection_lock` */
+	/* Protected by `proxy_wifi_connection_lock` */
 	u64 session_id;
 };
 
-DEFINE_RWLOCK(virt_wifi_connection_lock);
+DEFINE_RWLOCK(proxy_wifi_connection_lock);
 
-struct virt_wifi_netdev_priv {
+struct proxy_wifi_netdev_priv {
 	struct work_struct connect;
 	struct work_struct disconnect;
 	struct net_device *lowerdev;
@@ -440,60 +440,60 @@ struct virt_wifi_netdev_priv {
 	unsigned int notification_port;
 };
 
-static void virt_wifi_disconnect_finalize(struct net_device *netdev,
+static void proxy_wifi_disconnect_finalize(struct net_device *netdev,
 					  u16 reason_code);
 
-static void handle_disconnected_notification(struct virt_wifi_netdev_priv *priv,
+static void handle_disconnected_notification(struct proxy_wifi_netdev_priv *priv,
 					     struct hv_wifi_msg message)
 {
 	struct hv_wifi_disconnect_notif *disconnect_notif = NULL;
 	u64 session_id = 0;
 
-	netdev_info(priv->upperdev, "virt_wifi: Handling a disconnected notification\n");
+	netdev_info(priv->upperdev, "proxy_wifi: Handling a disconnected notification\n");
 
 	if (message.hdr.size != sizeof(struct hv_wifi_disconnect_notif))
 		netdev_warn(priv->upperdev,
-			    "virt_wifi: Unexpected size for a disconnect notification: %d bytes\n",
+			    "proxy_wifi: Unexpected size for a disconnect notification: %d bytes\n",
 			    message.hdr.size);
 
 	disconnect_notif = (struct hv_wifi_disconnect_notif *)message.body;
 
-	read_lock(&virt_wifi_connection_lock);
+	read_lock(&proxy_wifi_connection_lock);
 	session_id = priv->connection.session_id;
-	read_unlock(&virt_wifi_connection_lock);
+	read_unlock(&proxy_wifi_connection_lock);
 
 	if (disconnect_notif->session_id < session_id) {
 		netdev_warn(priv->upperdev,
-			    "virt_wifi: Ignoring an outdated disconnect notification. Notification session: %lld, current session: %lld\n",
+			    "proxy_wifi: Ignoring an outdated disconnect notification. Notification session: %lld, current session: %lld\n",
 			    disconnect_notif->session_id, session_id);
 		return;
 	}
 
-	virt_wifi_disconnect_finalize(priv->upperdev, WLAN_REASON_UNSPECIFIED);
+	proxy_wifi_disconnect_finalize(priv->upperdev, WLAN_REASON_UNSPECIFIED);
 }
 
 static
-void handle_signal_quality_notification(struct virt_wifi_netdev_priv *priv,
+void handle_signal_quality_notification(struct proxy_wifi_netdev_priv *priv,
 					struct hv_wifi_msg message)
 {
 	struct hv_wifi_signal_quality_notif *signal_notif = NULL;
 
-	netdev_dbg(priv->upperdev, "virt_wifi: Handling a signal quality notification\n");
+	netdev_dbg(priv->upperdev, "proxy_wifi: Handling a signal quality notification\n");
 
 	if (message.hdr.size != sizeof(struct hv_wifi_signal_quality_notif) ||
 	    !message.body) {
-		netdev_err(priv->upperdev, "virt_wifi: Invalid size for a signal quality notification: %d bytes\n",
+		netdev_err(priv->upperdev, "proxy_wifi: Invalid size for a signal quality notification: %d bytes\n",
 		       message.hdr.size);
 		return;
 	}
 	signal_notif = (struct hv_wifi_signal_quality_notif *)message.body;
 
-	write_lock(&virt_wifi_connection_lock);
+	write_lock(&proxy_wifi_connection_lock);
 	priv->connection.signal = signal_notif->signal;
-	write_unlock(&virt_wifi_connection_lock);
+	write_unlock(&proxy_wifi_connection_lock);
 }
 
-static void receive_notification(struct virt_wifi_netdev_priv *priv,
+static void receive_notification(struct proxy_wifi_netdev_priv *priv,
 				 struct socket *socket)
 {
 	int error = 0;
@@ -501,12 +501,12 @@ static void receive_notification(struct virt_wifi_netdev_priv *priv,
 
 	error = receive_hv_wifi_message(socket, &message);
 	if (error < 0) {
-		netdev_err(priv->upperdev, "virt_wifi: Failed to receive a notification, error %d\n",
+		netdev_err(priv->upperdev, "proxy_wifi: Failed to receive a notification, error %d\n",
 		       error);
 		goto out_free;
 	}
 
-	netdev_dbg(priv->upperdev, "virt_wifi: Got a notification, type %d\n",
+	netdev_dbg(priv->upperdev, "proxy_wifi: Got a notification, type %d\n",
 	       message.hdr.operation);
 
 	// Dispatch the notification
@@ -515,7 +515,7 @@ static void receive_notification(struct virt_wifi_netdev_priv *priv,
 	else if (message.hdr.operation == WIFI_NOTIF_SIGNAL_QUALITY)
 		handle_signal_quality_notification(priv, message);
 	else
-		netdev_warn(priv->upperdev, "virt_wifi: Received an unknown notification\n");
+		netdev_warn(priv->upperdev, "proxy_wifi: Received an unknown notification\n");
 
 out_free:
 	kfree(message.body);
@@ -525,8 +525,8 @@ static void poll_notifications(struct work_struct *work)
 {
 	int error = 0;
 	struct socket *connect_socket = NULL;
-	struct virt_wifi_netdev_priv *priv = container_of(work,
-		struct virt_wifi_netdev_priv, notifications_work.work);
+	struct proxy_wifi_netdev_priv *priv = container_of(work,
+		struct proxy_wifi_netdev_priv, notifications_work.work);
 
 	for (;;) {
 		error = kernel_accept(priv->notification_socket,
@@ -535,7 +535,7 @@ static void poll_notifications(struct work_struct *work)
 			// We are done processing incoming notifications
 			break;
 		} else if (error != 0) {
-			netdev_err(priv->upperdev, "virt_wifi: Failed to accept a connection, error %d",
+			netdev_err(priv->upperdev, "proxy_wifi: Failed to accept a connection, error %d",
 			       error);
 			break;
 		}
@@ -548,10 +548,10 @@ static void poll_notifications(struct work_struct *work)
 	}
 
 	// Re-arm the notification work
-	queue_delayed_work(virt_wifi_command_wq, &priv->notifications_work, 10 * min(1, HZ / 1000));
+	queue_delayed_work(proxy_wifi_command_wq, &priv->notifications_work, 10 * min(1, HZ / 1000));
 }
 
-static int setup_notification_channel(struct virt_wifi_netdev_priv *netdev_priv,
+static int setup_notification_channel(struct proxy_wifi_netdev_priv *netdev_priv,
 				      unsigned int port)
 {
 	int error = 0;
@@ -564,7 +564,7 @@ static int setup_notification_channel(struct virt_wifi_netdev_priv *netdev_priv,
 	error = sock_create_kern(&init_net, AF_VSOCK, SOCK_STREAM, 0,
 				 &netdev_priv->notification_socket);
 	if (error != 0) {
-		netdev_err(netdev_priv->upperdev, "virt_wifi: Failed to create the notification socket, error %d",
+		netdev_err(netdev_priv->upperdev, "proxy_wifi: Failed to create the notification socket, error %d",
 		           error);
 		return error;
 	}
@@ -572,22 +572,22 @@ static int setup_notification_channel(struct virt_wifi_netdev_priv *netdev_priv,
 	error = kernel_bind(netdev_priv->notification_socket,
 			    (struct sockaddr *)&addr, sizeof(addr));
 	if (error != 0) {
-		netdev_err(netdev_priv->upperdev, "virt_wifi: Failed to bind the notification socket, error %d",
+		netdev_err(netdev_priv->upperdev, "proxy_wifi: Failed to bind the notification socket, error %d",
 		           error);
 		goto out_release_sock;
 	}
 
 	error = kernel_listen(netdev_priv->notification_socket, INT_MAX);
 	if (error != 0) {
-		netdev_err(netdev_priv->upperdev, "virt_wifi: Failed to listen on the notification socket, error %d",
+		netdev_err(netdev_priv->upperdev, "proxy_wifi: Failed to listen on the notification socket, error %d",
 		           error);
 		goto out_release_sock;
 	}
 
 	// Start the notification handling thread
 	INIT_DELAYED_WORK(&netdev_priv->notifications_work, poll_notifications);
-	if (!queue_delayed_work(virt_wifi_command_wq, &netdev_priv->notifications_work, 10 * HZ / 1000)) {
-		netdev_err(netdev_priv->upperdev, "virt_wifi: Failed to start the notification work");
+	if (!queue_delayed_work(proxy_wifi_command_wq, &netdev_priv->notifications_work, 10 * HZ / 1000)) {
+		netdev_err(netdev_priv->upperdev, "proxy_wifi: Failed to start the notification work");
 		error = -EINVAL;
 		goto out_release_sock;
 	}
@@ -599,9 +599,9 @@ out_release_sock:
 	return error;
 }
 
-static void stop_notification_channel(struct virt_wifi_netdev_priv *netdev_priv)
+static void stop_notification_channel(struct proxy_wifi_netdev_priv *netdev_priv)
 {
-	netdev_dbg(netdev_priv->upperdev, "virt_wifi: Waiting for notification work completion...");
+	netdev_dbg(netdev_priv->upperdev, "proxy_wifi: Waiting for notification work completion...");
 	cancel_delayed_work_sync(&netdev_priv->notifications_work);
 
 	sock_release(netdev_priv->notification_socket);
@@ -610,7 +610,7 @@ static void stop_notification_channel(struct virt_wifi_netdev_priv *netdev_priv)
 
 static struct wiphy *common_wiphy;
 
-struct virt_wifi_wiphy_priv {
+struct proxy_wifi_wiphy_priv {
 	struct work_struct scan_result;
 	/* Not protected but access are sequentials */
 	struct cfg80211_scan_request *scan_request;
@@ -944,18 +944,18 @@ static struct ieee80211_supported_band band_6ghz = {
 };
 
 /* Called with the rtnl lock held. */
-static int virt_wifi_scan(struct wiphy *wiphy,
+static int proxy_wifi_scan(struct wiphy *wiphy,
 			  struct cfg80211_scan_request *request)
 {
-	struct virt_wifi_wiphy_priv *priv = wiphy_priv(wiphy);
+	struct proxy_wifi_wiphy_priv *priv = wiphy_priv(wiphy);
 
-	wiphy_info(wiphy, "virt_wifi: Starting a scan request\n");
+	wiphy_info(wiphy, "proxy_wifi: Starting a scan request\n");
 
 	if (priv->scan_request || priv->being_deleted)
 		return -EBUSY;
 
 	priv->scan_request = request;
-	if (!queue_work(virt_wifi_command_wq, &priv->scan_result))
+	if (!queue_work(proxy_wifi_command_wq, &priv->scan_result))
 		return -EBUSY;
 
 	return 0;
@@ -969,7 +969,7 @@ static int report_scanned_network(struct wiphy *wiphy, struct hv_wifi_bss *bss)
 
 	channel = ieee80211_get_channel_khz(wiphy, bss->channel_center_freq);
 	if (!channel) {
-		dev_warn(&wiphy->dev, "virt_wifi: Unsupported frequency %d, ignoring scan result\n",
+		dev_warn(&wiphy->dev, "proxy_wifi: Unsupported frequency %d, ignoring scan result\n",
 		         bss->channel_center_freq);
 		return -EINVAL;
 	}
@@ -995,12 +995,12 @@ static bool is_bss_valid(const struct hv_wifi_bss *bss,
 }
 
 /* Acquires and releases the rdev BSS lock. */
-static void virt_wifi_scan_result(struct work_struct *work)
+static void proxy_wifi_scan_result(struct work_struct *work)
 {
-	struct virt_wifi_wiphy_priv *w_priv =
-		container_of(work, struct virt_wifi_wiphy_priv, scan_result);
+	struct proxy_wifi_wiphy_priv *w_priv =
+		container_of(work, struct proxy_wifi_wiphy_priv, scan_result);
 	struct wiphy *wiphy = priv_to_wiphy(w_priv);
-	struct virt_wifi_netdev_priv *n_priv =
+	struct proxy_wifi_netdev_priv *n_priv =
 				netdev_priv(w_priv->scan_request->wdev->netdev);
 	struct cfg80211_scan_info scan_info = { .aborted = false };
 	struct hv_wifi_msg message = {0};
@@ -1009,14 +1009,14 @@ static void virt_wifi_scan_result(struct work_struct *work)
 	int i = 0;
 
 	if (!w_priv->scan_request) {
-		netdev_err(n_priv->upperdev, "virt_wifi: No scan parameters for a scan request\n");
+		netdev_err(n_priv->upperdev, "proxy_wifi: No scan parameters for a scan request\n");
 		scan_info.aborted = true;
 		goto complete_scan;
 	}
 
 	message = scan_command(n_priv->request_port, w_priv->scan_request);
 	if (message.hdr.operation != WIFI_OP_SCAN_RESPONSE) {
-		netdev_err(n_priv->upperdev, "virt_wifi: Invalid scan response (Operation: %d)\n",
+		netdev_err(n_priv->upperdev, "proxy_wifi: Invalid scan response (Operation: %d)\n",
 		           message.hdr.operation);
 		scan_info.aborted = true;
 		goto complete_scan;
@@ -1024,13 +1024,13 @@ static void virt_wifi_scan_result(struct work_struct *work)
 
 	scan_response = (struct hv_wifi_scan_response *)message.body;
 
-	netdev_info(n_priv->upperdev, "virt_wifi: Received %u scan results\n",
+	netdev_info(n_priv->upperdev, "proxy_wifi: Received %u scan results\n",
 	            scan_response->num_bss);
 
 	for (i = 0; i < scan_response->num_bss; i++) {
 		bss = &scan_response->bss[i];
 		if (!is_bss_valid(bss, &message)) {
-			netdev_warn(n_priv->upperdev, "virt_wifi: Ignoring an invalid scan result (Index %d)",
+			netdev_warn(n_priv->upperdev, "proxy_wifi: Ignoring an invalid scan result (Index %d)",
 			            i);
 			continue;
 		}
@@ -1047,16 +1047,16 @@ complete_scan:
 }
 
 /* May acquire and release the rdev BSS lock. */
-static void virt_wifi_cancel_scan(struct wiphy *wiphy)
+static void proxy_wifi_cancel_scan(struct wiphy *wiphy)
 {
-	struct virt_wifi_wiphy_priv *priv = wiphy_priv(wiphy);
+	struct proxy_wifi_wiphy_priv *priv = wiphy_priv(wiphy);
 	struct cfg80211_scan_info scan_info = { .aborted = true };
 
 	cancel_work_sync(&priv->scan_result);
 
 	/* Clean up dangling callbacks if necessary. */
 	if (priv->scan_request) {
-		wiphy_info(wiphy, "virt_wifi: A scan request was canceled\n");
+		wiphy_info(wiphy, "proxy_wifi: A scan request was canceled\n");
 		/* Schedules work which acquires and releases the rtnl lock. */
 		cfg80211_scan_done(priv->scan_request, &scan_info);
 		priv->scan_request = NULL;
@@ -1118,14 +1118,14 @@ static int build_connect_request_context(struct cfg80211_connect_params *sme,
 }
 
 /* Called with the rtnl lock held. */
-/* Acquires and releases virt_wifi_connection_lock. */
-static int virt_wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
+/* Acquires and releases proxy_wifi_connection_lock. */
+static int proxy_wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 			     struct cfg80211_connect_params *sme)
 {
 	int error = 0;
-	struct virt_wifi_netdev_priv *priv = netdev_priv(netdev);
+	struct proxy_wifi_netdev_priv *priv = netdev_priv(netdev);
 
-	wiphy_info(wiphy, "virt_wifi: Starting a connection request\n");
+	wiphy_info(wiphy, "proxy_wifi: Starting a connection request\n");
 
 	if (priv->being_deleted || !priv->is_up)
 		return -EBUSY;
@@ -1134,38 +1134,38 @@ static int virt_wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	priv->connect_req_ctx = NULL;
 	error = build_connect_request_context(sme, &priv->connect_req_ctx);
 	if (error < 0) {
-		wiphy_err(wiphy, "virt_wifi: Failed to build the connect request context: %d\n",
+		wiphy_err(wiphy, "proxy_wifi: Failed to build the connect request context: %d\n",
 		           error);
 		return error;
 	}
 
 	/* Set the bssid for the canceling the connection if needed */
-	write_lock(&virt_wifi_connection_lock);
+	write_lock(&proxy_wifi_connection_lock);
 	if (sme->bssid)
 		ether_addr_copy(priv->connection.bssid, sme->bssid);
 	else
 		eth_zero_addr(priv->connection.bssid);
-	write_unlock(&virt_wifi_connection_lock);
+	write_unlock(&proxy_wifi_connection_lock);
 
-	if (!queue_work(virt_wifi_command_wq, &priv->connect))
+	if (!queue_work(proxy_wifi_command_wq, &priv->connect))
 		return -EBUSY;
 
 	return 0;
 }
 
 /* Acquires and releases the rdev event lock. */
-/* Acquires and releases virt_wifi_connection_lock. */
-static void virt_wifi_connect_complete(struct work_struct *work)
+/* Acquires and releases proxy_wifi_connection_lock. */
+static void proxy_wifi_connect_complete(struct work_struct *work)
 {
-	struct virt_wifi_netdev_priv *priv =
-		container_of(work, struct virt_wifi_netdev_priv, connect);
+	struct proxy_wifi_netdev_priv *priv =
+		container_of(work, struct proxy_wifi_netdev_priv, connect);
 	u16 status = WLAN_STATUS_UNSPECIFIED_FAILURE;
 	struct hv_wifi_connect_response *connect_response = NULL;
 	struct hv_wifi_msg message = {0};
 	u8 connected_bssid[ETH_ALEN];
 
 	if (!priv->connect_req_ctx) {
-		netdev_err(priv->upperdev, "virt_wifi: No connection parameters for a connection request\n");
+		netdev_err(priv->upperdev, "proxy_wifi: No connection parameters for a connection request\n");
 		goto complete_connect;
 	}
 
@@ -1175,7 +1175,7 @@ static void virt_wifi_connect_complete(struct work_struct *work)
 	message = connect_command(priv->request_port, priv->connect_req_ctx);
 
 	if (message.hdr.operation != WIFI_OP_CONNECT_RESPONSE) {
-		netdev_err(priv->upperdev, "virt_wifi: Invalid connect response (Operation: %d)\n",
+		netdev_err(priv->upperdev, "proxy_wifi: Invalid connect response (Operation: %d)\n",
 		           message.hdr.operation);
 		goto complete_connect;
 	}
@@ -1183,19 +1183,19 @@ static void virt_wifi_connect_complete(struct work_struct *work)
 	connect_response = (struct hv_wifi_connect_response *)message.body;
 	status = connect_response->result_code;
 
-	netdev_info(priv->upperdev, "virt_wifi: Connection result: %d, session id: %lld\n",
+	netdev_info(priv->upperdev, "proxy_wifi: Connection result: %d, session id: %lld\n",
 	            status, connect_response->session_id);
 
 	if (status == WLAN_STATUS_SUCCESS) {
 		/* Set the current connection information */
-		write_lock(&virt_wifi_connection_lock);
+		write_lock(&proxy_wifi_connection_lock);
 		priv->connection.is_connected = true;
 		/* Can't use ether_addr_copy: dest bssid not aligned to u16 */
 		memcpy(priv->connection.bssid, connect_response->bssid,
 		       sizeof(priv->connection.bssid));
 		priv->connection.signal = -50;
 		priv->connection.session_id = connect_response->session_id;
-		write_unlock(&virt_wifi_connection_lock);
+		write_unlock(&proxy_wifi_connection_lock);
 
 		priv->connection.tx_failed = 0;
 		priv->connection.tx_packets = 0;
@@ -1204,9 +1204,9 @@ static void virt_wifi_connect_complete(struct work_struct *work)
 	}
 
 complete_connect:
-	write_lock(&virt_wifi_connection_lock);
+	write_lock(&proxy_wifi_connection_lock);
 	ether_addr_copy(connected_bssid, priv->connection.bssid);
-	write_unlock(&virt_wifi_connection_lock);
+	write_unlock(&proxy_wifi_connection_lock);
 
 	/* Schedules an event that acquires the rtnl lock. */
 	cfg80211_connect_result(priv->upperdev, connected_bssid, NULL, 0, NULL,
@@ -1219,20 +1219,20 @@ complete_connect:
 }
 
 /* May acquire and release the rdev event lock. */
-/* May acquire and release virt_wifi_connection_lock */
-static void virt_wifi_cancel_connect(struct net_device *netdev)
+/* May acquire and release proxy_wifi_connection_lock */
+static void proxy_wifi_cancel_connect(struct net_device *netdev)
 {
 	u8 bssid[ETH_ALEN] = {0};
-	struct virt_wifi_netdev_priv *priv = netdev_priv(netdev);
+	struct proxy_wifi_netdev_priv *priv = netdev_priv(netdev);
 
 	/* If there is work pending, clean up dangling callbacks. */
 	if (cancel_work_sync(&priv->connect)) {
 		netdev_info(netdev,
-			    "virt_wifi: A connection request was canceled\n");
+			    "proxy_wifi: A connection request was canceled\n");
 
-		read_lock(&virt_wifi_connection_lock);
+		read_lock(&proxy_wifi_connection_lock);
 		ether_addr_copy(bssid, priv->connection.bssid);
-		read_unlock(&virt_wifi_connection_lock);
+		read_unlock(&proxy_wifi_connection_lock);
 
 		/* Schedules an event that acquires the rtnl lock. */
 		cfg80211_connect_result(priv->upperdev, bssid, NULL, 0, NULL, 0,
@@ -1242,17 +1242,17 @@ static void virt_wifi_cancel_connect(struct net_device *netdev)
 }
 
 /* Subcall acquires the rdev event lock. */
-/* Acquires and releases virt_wifi_connection_lock */
-static void virt_wifi_disconnect_finalize(struct net_device *netdev,
+/* Acquires and releases proxy_wifi_connection_lock */
+static void proxy_wifi_disconnect_finalize(struct net_device *netdev,
 					  u16 reason_code)
 {
-	struct virt_wifi_netdev_priv *priv = netdev_priv(netdev);
+	struct proxy_wifi_netdev_priv *priv = netdev_priv(netdev);
 	bool is_connected = false;
 
-	write_lock(&virt_wifi_connection_lock);
+	write_lock(&proxy_wifi_connection_lock);
 	is_connected = priv->connection.is_connected;
 	priv->connection.is_connected = false;
-	write_unlock(&virt_wifi_connection_lock);
+	write_unlock(&proxy_wifi_connection_lock);
 
 	if (is_connected) {
 		cfg80211_disconnected(netdev, reason_code, NULL, 0, true, GFP_KERNEL);
@@ -1261,56 +1261,56 @@ static void virt_wifi_disconnect_finalize(struct net_device *netdev,
 }
 
 /* Subcall acquires the rdev event lock. */
-/* Subcall acquires and releases virt_wifi_connection_lock */
-static void virt_wifi_disconnect_complete(struct work_struct *work)
+/* Subcall acquires and releases proxy_wifi_connection_lock */
+static void proxy_wifi_disconnect_complete(struct work_struct *work)
 {
-	struct virt_wifi_netdev_priv *priv =
-		container_of(work, struct virt_wifi_netdev_priv, disconnect);
+	struct proxy_wifi_netdev_priv *priv =
+		container_of(work, struct proxy_wifi_netdev_priv, disconnect);
 	struct hv_wifi_msg message = {0};
 	u64 session_id = 0;
 
-	read_lock(&virt_wifi_connection_lock);
+	read_lock(&proxy_wifi_connection_lock);
 	session_id = priv->connection.session_id;
-	read_unlock(&virt_wifi_connection_lock);
+	read_unlock(&proxy_wifi_connection_lock);
 
 	message = disconnect_command(priv->request_port, session_id);
 
-	netdev_info(priv->upperdev, "virt_wifi: Disconnected, session id %lld\n",
+	netdev_info(priv->upperdev, "proxy_wifi: Disconnected, session id %lld\n",
 	            session_id);
 
 	/* Still complete the disconnection on error */
 	if (message.hdr.operation != WIFI_OP_DISCONNECT_RESPONSE)
-		netdev_err(priv->upperdev, "virt_wifi: Expected WIFI_OP_DISCONNECT_RESPONSE, got: %d",
+		netdev_err(priv->upperdev, "proxy_wifi: Expected WIFI_OP_DISCONNECT_RESPONSE, got: %d",
 		       message.hdr.operation);
 
-	virt_wifi_disconnect_finalize(priv->upperdev, WLAN_REASON_UNSPECIFIED);
+	proxy_wifi_disconnect_finalize(priv->upperdev, WLAN_REASON_UNSPECIFIED);
 
 	kfree(message.body);
 }
 
 /* Called with the rtnl lock held. */
 /* Subcall acquires and releases the rdev event lock. */
-/* Subcall acquires and releases virt_wifi_connection_lock. */
-static int virt_wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev,
+/* Subcall acquires and releases proxy_wifi_connection_lock. */
+static int proxy_wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 				u16 reason_code)
 {
-	struct virt_wifi_netdev_priv *priv = netdev_priv(netdev);
+	struct proxy_wifi_netdev_priv *priv = netdev_priv(netdev);
 	bool is_connected = false;
 
 	if (priv->being_deleted)
 		return -EBUSY;
 
-	wiphy_info(wiphy, "virt_wifi: Starting a disconnect request\n");
-	virt_wifi_cancel_connect(netdev);
+	wiphy_info(wiphy, "proxy_wifi: Starting a disconnect request\n");
+	proxy_wifi_cancel_connect(netdev);
 
-	read_lock(&virt_wifi_connection_lock);
+	read_lock(&proxy_wifi_connection_lock);
 	is_connected = priv->connection.is_connected;
-	read_unlock(&virt_wifi_connection_lock);
+	read_unlock(&proxy_wifi_connection_lock);
 
 	if (!is_connected) {
-		virt_wifi_disconnect_finalize(netdev, reason_code);
+		proxy_wifi_disconnect_finalize(netdev, reason_code);
 	} else {
-		if (!queue_work(virt_wifi_command_wq, &priv->disconnect))
+		if (!queue_work(proxy_wifi_command_wq, &priv->disconnect))
 			return -EBUSY;
 	}
 
@@ -1318,16 +1318,16 @@ static int virt_wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 }
 
 /* Called with the rtnl lock held. */
-/* Acquires and releases virt_wifi_connection_lock. */
-static int virt_wifi_get_station(struct wiphy *wiphy, struct net_device *dev,
+/* Acquires and releases proxy_wifi_connection_lock. */
+static int proxy_wifi_get_station(struct wiphy *wiphy, struct net_device *dev,
 				 const u8 *mac, struct station_info *sinfo)
 {
 	int error = 0;
-	struct virt_wifi_netdev_priv *priv = netdev_priv(dev);
+	struct proxy_wifi_netdev_priv *priv = netdev_priv(dev);
 
-	wiphy_dbg(wiphy, "virt_wifi: Reporting station info\n");
+	wiphy_dbg(wiphy, "proxy_wifi: Reporting station info\n");
 
-	read_lock(&virt_wifi_connection_lock);
+	read_lock(&proxy_wifi_connection_lock);
 
 	if (!priv->connection.is_connected) {
 		error = -ENOENT;
@@ -1352,47 +1352,47 @@ static int virt_wifi_get_station(struct wiphy *wiphy, struct net_device *dev,
 	};
 
 out_unlock:
-	read_unlock(&virt_wifi_connection_lock);
+	read_unlock(&proxy_wifi_connection_lock);
 	return error;
 }
 
 /* Called with the rtnl lock held. */
-/* Acquires and releases virt_wifi_connection_lock. */
-static int virt_wifi_dump_station(struct wiphy *wiphy, struct net_device *dev,
+/* Acquires and releases proxy_wifi_connection_lock. */
+static int proxy_wifi_dump_station(struct wiphy *wiphy, struct net_device *dev,
 				  int idx, u8 *mac, struct station_info *sinfo)
 {
-	struct virt_wifi_netdev_priv *priv = netdev_priv(dev);
+	struct proxy_wifi_netdev_priv *priv = netdev_priv(dev);
 	bool is_connected = false;
 
-	read_lock(&virt_wifi_connection_lock);
+	read_lock(&proxy_wifi_connection_lock);
 	is_connected = priv->connection.is_connected;
 	ether_addr_copy(mac, priv->connection.bssid);
-	read_unlock(&virt_wifi_connection_lock);
+	read_unlock(&proxy_wifi_connection_lock);
 
 	if (idx != 0 || !is_connected)
 		return -ENOENT;
 
-	return virt_wifi_get_station(wiphy, dev, mac, sinfo);
+	return proxy_wifi_get_station(wiphy, dev, mac, sinfo);
 }
 
-static const struct cfg80211_ops virt_wifi_cfg80211_ops = {
-	.scan = virt_wifi_scan,
+static const struct cfg80211_ops proxy_wifi_cfg80211_ops = {
+	.scan = proxy_wifi_scan,
 
-	.connect = virt_wifi_connect,
-	.disconnect = virt_wifi_disconnect,
+	.connect = proxy_wifi_connect,
+	.disconnect = proxy_wifi_disconnect,
 
-	.get_station = virt_wifi_get_station,
-	.dump_station = virt_wifi_dump_station,
+	.get_station = proxy_wifi_get_station,
+	.dump_station = proxy_wifi_dump_station,
 };
 
 /* Acquires and releases the rtnl lock. */
-static struct wiphy *virt_wifi_make_wiphy(void)
+static struct wiphy *proxy_wifi_make_wiphy(void)
 {
 	struct wiphy *wiphy;
-	struct virt_wifi_wiphy_priv *priv;
+	struct proxy_wifi_wiphy_priv *priv;
 	int err;
 
-	wiphy = wiphy_new(&virt_wifi_cfg80211_ops, sizeof(*priv));
+	wiphy = wiphy_new(&proxy_wifi_cfg80211_ops, sizeof(*priv));
 
 	if (!wiphy)
 		return NULL;
@@ -1424,7 +1424,7 @@ static struct wiphy *virt_wifi_make_wiphy(void)
 	priv = wiphy_priv(wiphy);
 	priv->being_deleted = false;
 	priv->scan_request = NULL;
-	INIT_WORK(&priv->scan_result, virt_wifi_scan_result);
+	INIT_WORK(&priv->scan_result, proxy_wifi_scan_result);
 
 	err = wiphy_register(wiphy);
 	if (err < 0) {
@@ -1436,17 +1436,17 @@ static struct wiphy *virt_wifi_make_wiphy(void)
 }
 
 /* Acquires and releases the rtnl lock. */
-static void virt_wifi_destroy_wiphy(struct wiphy *wiphy)
+static void proxy_wifi_destroy_wiphy(struct wiphy *wiphy)
 {
-	struct virt_wifi_wiphy_priv *priv;
+	struct proxy_wifi_wiphy_priv *priv;
 
-	WARN(!wiphy, "virt_wifi: %s called with null wiphy", __func__);
+	WARN(!wiphy, "proxy_wifi: %s called with null wiphy", __func__);
 	if (!wiphy)
 		return;
 
 	priv = wiphy_priv(wiphy);
 	priv->being_deleted = true;
-	virt_wifi_cancel_scan(wiphy);
+	proxy_wifi_cancel_scan(wiphy);
 
 	if (wiphy->registered)
 		wiphy_unregister(wiphy);
@@ -1454,16 +1454,16 @@ static void virt_wifi_destroy_wiphy(struct wiphy *wiphy)
 }
 
 /* Enters and exits a RCU-bh critical section. */
-/* Aquires and releases virt_wifi_connection_lock. */
-static netdev_tx_t virt_wifi_start_xmit(struct sk_buff *skb,
+/* Aquires and releases proxy_wifi_connection_lock. */
+static netdev_tx_t proxy_wifi_start_xmit(struct sk_buff *skb,
 					struct net_device *dev)
 {
 	bool is_connected = false;
-	struct virt_wifi_netdev_priv *priv = netdev_priv(dev);
+	struct proxy_wifi_netdev_priv *priv = netdev_priv(dev);
 
-	read_lock(&virt_wifi_connection_lock);
+	read_lock(&proxy_wifi_connection_lock);
 	is_connected = priv->connection.is_connected;
-	read_unlock(&virt_wifi_connection_lock);
+	read_unlock(&proxy_wifi_connection_lock);
 
 	priv->connection.tx_packets++;
 	if (!is_connected)
@@ -1477,49 +1477,49 @@ static netdev_tx_t virt_wifi_start_xmit(struct sk_buff *skb,
 }
 
 /* Called with rtnl lock held. */
-static int virt_wifi_net_device_open(struct net_device *dev)
+static int proxy_wifi_net_device_open(struct net_device *dev)
 {
-	struct virt_wifi_netdev_priv *priv = netdev_priv(dev);
+	struct proxy_wifi_netdev_priv *priv = netdev_priv(dev);
 
-	netdev_info(dev, "virt_wifi: underlying device up");
+	netdev_info(dev, "proxy_wifi: underlying device up");
 	priv->is_up = true;
 	return 0;
 }
 
 /* Called with rtnl lock held. */
-static int virt_wifi_net_device_stop(struct net_device *dev)
+static int proxy_wifi_net_device_stop(struct net_device *dev)
 {
-	struct virt_wifi_netdev_priv *n_priv = netdev_priv(dev);
+	struct proxy_wifi_netdev_priv *n_priv = netdev_priv(dev);
 
-	netdev_info(dev, "virt_wifi: underlying device down\n");
+	netdev_info(dev, "proxy_wifi: underlying device down\n");
 	n_priv->is_up = false;
 
 	if (!dev->ieee80211_ptr)
 		return 0;
 
-	virt_wifi_cancel_scan(dev->ieee80211_ptr->wiphy);
-	virt_wifi_cancel_connect(dev);
+	proxy_wifi_cancel_scan(dev->ieee80211_ptr->wiphy);
+	proxy_wifi_cancel_connect(dev);
 	netif_carrier_off(dev);
 
 	return 0;
 }
 
-static int virt_wifi_net_device_get_iflink(const struct net_device *dev)
+static int proxy_wifi_net_device_get_iflink(const struct net_device *dev)
 {
-	struct virt_wifi_netdev_priv *priv = netdev_priv(dev);
+	struct proxy_wifi_netdev_priv *priv = netdev_priv(dev);
 
 	return priv->lowerdev->ifindex;
 }
 
-static const struct net_device_ops virt_wifi_ops = {
-	.ndo_start_xmit = virt_wifi_start_xmit,
-	.ndo_open	= virt_wifi_net_device_open,
-	.ndo_stop	= virt_wifi_net_device_stop,
-	.ndo_get_iflink = virt_wifi_net_device_get_iflink,
+static const struct net_device_ops proxy_wifi_ops = {
+	.ndo_start_xmit = proxy_wifi_start_xmit,
+	.ndo_open	= proxy_wifi_net_device_open,
+	.ndo_stop	= proxy_wifi_net_device_stop,
+	.ndo_get_iflink = proxy_wifi_net_device_get_iflink,
 };
 
 /* Invoked as part of rtnl lock release. */
-static void virt_wifi_net_device_destructor(struct net_device *dev)
+static void proxy_wifi_net_device_destructor(struct net_device *dev)
 {
 	/* Delayed past dellink to allow nl80211 to react to the device being
 	 * deleted.
@@ -1529,25 +1529,25 @@ static void virt_wifi_net_device_destructor(struct net_device *dev)
 }
 
 /* No lock interaction. */
-static void virt_wifi_setup(struct net_device *dev)
+static void proxy_wifi_setup(struct net_device *dev)
 {
 	ether_setup(dev);
-	dev->netdev_ops = &virt_wifi_ops;
+	dev->netdev_ops = &proxy_wifi_ops;
 	dev->needs_free_netdev = true;
 }
 
 /* Called in a RCU read critical section from netif_receive_skb. */
-/* Aquires and releases virt_wifi_connection_lock. */
-static rx_handler_result_t virt_wifi_rx_handler(struct sk_buff **pskb)
+/* Aquires and releases proxy_wifi_connection_lock. */
+static rx_handler_result_t proxy_wifi_rx_handler(struct sk_buff **pskb)
 {
 	bool is_connected = false;
 	struct sk_buff *skb = *pskb;
-	struct virt_wifi_netdev_priv *priv =
+	struct proxy_wifi_netdev_priv *priv =
 		rcu_dereference(skb->dev->rx_handler_data);
 
-	read_lock(&virt_wifi_connection_lock);
+	read_lock(&proxy_wifi_connection_lock);
 	is_connected = priv->connection.is_connected;
-	read_unlock(&virt_wifi_connection_lock);
+	read_unlock(&proxy_wifi_connection_lock);
 
 	if (!is_connected)
 		return RX_HANDLER_PASS;
@@ -1555,7 +1555,7 @@ static rx_handler_result_t virt_wifi_rx_handler(struct sk_buff **pskb)
 	/* GFP_ATOMIC because this is a packet interrupt handler. */
 	skb = skb_share_check(skb, GFP_ATOMIC);
 	if (!skb) {
-		dev_err(&priv->upperdev->dev, "virt_wifi: Can't skb_share_check\n");
+		dev_err(&priv->upperdev->dev, "proxy_wifi: Can't skb_share_check\n");
 		return RX_HANDLER_CONSUMED;
 	}
 
@@ -1566,14 +1566,14 @@ static rx_handler_result_t virt_wifi_rx_handler(struct sk_buff **pskb)
 }
 
 /* Called with rtnl lock held. */
-static int virt_wifi_newlink(struct net *src_net, struct net_device *dev,
+static int proxy_wifi_newlink(struct net *src_net, struct net_device *dev,
 			     struct nlattr *tb[], struct nlattr *data[],
 			     struct netlink_ext_ack *extack)
 {
-	struct virt_wifi_netdev_priv *priv = netdev_priv(dev);
+	struct proxy_wifi_netdev_priv *priv = netdev_priv(dev);
 	int err;
 
-	netdev_info(dev, "virt_wifi: New link\n");
+	netdev_info(dev, "proxy_wifi: New link\n");
 
 	if (!tb[IFLA_LINK])
 		return -EINVAL;
@@ -1591,11 +1591,11 @@ static int virt_wifi_newlink(struct net *src_net, struct net_device *dev,
 	else if (dev->mtu > priv->lowerdev->mtu)
 		return -EINVAL;
 
-	err = netdev_rx_handler_register(priv->lowerdev, virt_wifi_rx_handler,
+	err = netdev_rx_handler_register(priv->lowerdev, proxy_wifi_rx_handler,
 					 priv);
 	if (err) {
 		dev_err(&priv->lowerdev->dev,
-			"virt_wifi: Can't netdev_rx_handler_register: %d\n",
+			"proxy_wifi: Can't netdev_rx_handler_register: %d\n",
 			err);
 		return err;
 	}
@@ -1617,29 +1617,29 @@ static int virt_wifi_newlink(struct net *src_net, struct net_device *dev,
 	err = register_netdevice(dev);
 	if (err) {
 		dev_err(&priv->lowerdev->dev,
-			"virt_wifi: can't register_netdevice: %d\n", err);
+			"proxy_wifi: can't register_netdevice: %d\n", err);
 		goto free_wireless_dev;
 	}
 
 	err = netdev_upper_dev_link(priv->lowerdev, dev, extack);
 	if (err) {
 		dev_err(&priv->lowerdev->dev,
-			"virt_wifi: can't netdev_upper_dev_link: %d\n", err);
+			"proxy_wifi: can't netdev_upper_dev_link: %d\n", err);
 		goto unregister_netdev;
 	}
 
-	dev->priv_destructor = virt_wifi_net_device_destructor;
+	dev->priv_destructor = proxy_wifi_net_device_destructor;
 	priv->being_deleted = false;
 	priv->is_up = false;
 	priv->connect_req_ctx = NULL;
-	INIT_WORK(&priv->connect, virt_wifi_connect_complete);
-	INIT_WORK(&priv->disconnect, virt_wifi_disconnect_complete);
+	INIT_WORK(&priv->connect, proxy_wifi_connect_complete);
+	INIT_WORK(&priv->disconnect, proxy_wifi_disconnect_complete);
 
-	write_lock(&virt_wifi_connection_lock);
+	write_lock(&proxy_wifi_connection_lock);
 	priv->connection.is_connected = false;
 	eth_zero_addr(priv->connection.bssid);
 	priv->connection.signal = 0;
-	write_unlock(&virt_wifi_connection_lock);
+	write_unlock(&proxy_wifi_connection_lock);
 
 	priv->connection.tx_packets = 0;
 	priv->connection.tx_failed = 0;
@@ -1650,7 +1650,7 @@ static int virt_wifi_newlink(struct net *src_net, struct net_device *dev,
 	err = setup_notification_channel(priv, priv->notification_port);
 	if (err) {
 		dev_err(&priv->lowerdev->dev,
-			"virt_wifi: can't start the notification channel: %d\n",
+			"proxy_wifi: can't start the notification channel: %d\n",
 			err);
 		goto unregister_netdev;
 	}
@@ -1671,18 +1671,18 @@ remove_handler:
 }
 
 /* Called with rtnl lock held. */
-static void virt_wifi_dellink(struct net_device *dev,
+static void proxy_wifi_dellink(struct net_device *dev,
 			      struct list_head *head)
 {
-	struct virt_wifi_netdev_priv *priv = netdev_priv(dev);
+	struct proxy_wifi_netdev_priv *priv = netdev_priv(dev);
 
-	netdev_info(dev, "virt_wifi: Delete link\n");
+	netdev_info(dev, "proxy_wifi: Delete link\n");
 
 	if (dev->ieee80211_ptr)
-		virt_wifi_cancel_scan(dev->ieee80211_ptr->wiphy);
+		proxy_wifi_cancel_scan(dev->ieee80211_ptr->wiphy);
 
 	priv->being_deleted = true;
-	virt_wifi_cancel_connect(dev);
+	proxy_wifi_cancel_connect(dev);
 
 	kfree(priv->connect_req_ctx);
 	priv->connect_req_ctx = NULL;
@@ -1702,28 +1702,28 @@ static void virt_wifi_dellink(struct net_device *dev,
 	/* Deleting the wiphy is handled in the module destructor. */
 }
 
-static struct rtnl_link_ops virt_wifi_link_ops = {
+static struct rtnl_link_ops proxy_wifi_link_ops = {
 	.kind		= "proxy_wifi",
-	.setup		= virt_wifi_setup,
-	.newlink	= virt_wifi_newlink,
-	.dellink	= virt_wifi_dellink,
-	.priv_size	= sizeof(struct virt_wifi_netdev_priv),
+	.setup		= proxy_wifi_setup,
+	.newlink	= proxy_wifi_newlink,
+	.dellink	= proxy_wifi_dellink,
+	.priv_size	= sizeof(struct proxy_wifi_netdev_priv),
 };
 
-static bool netif_is_virt_wifi_dev(const struct net_device *dev)
+static bool netif_is_proxy_wifi_dev(const struct net_device *dev)
 {
-	return rcu_access_pointer(dev->rx_handler) == virt_wifi_rx_handler;
+	return rcu_access_pointer(dev->rx_handler) == proxy_wifi_rx_handler;
 }
 
-static int virt_wifi_event(struct notifier_block *this, unsigned long event,
+static int proxy_wifi_event(struct notifier_block *this, unsigned long event,
 			   void *ptr)
 {
 	struct net_device *lower_dev = netdev_notifier_info_to_dev(ptr);
-	struct virt_wifi_netdev_priv *priv;
+	struct proxy_wifi_netdev_priv *priv;
 	struct net_device *upper_dev;
 	LIST_HEAD(list_kill);
 
-	if (!netif_is_virt_wifi_dev(lower_dev))
+	if (!netif_is_proxy_wifi_dev(lower_dev))
 		return NOTIFY_DONE;
 
 	switch (event) {
@@ -1746,63 +1746,63 @@ static int virt_wifi_event(struct notifier_block *this, unsigned long event,
 		eth_hw_addr_inherit(upper_dev, lower_dev);
 		netif_stacked_transfer_operstate(lower_dev, upper_dev);
 
-		netdev_info(upper_dev, "virt_wifi: MAC address update\n");
+		netdev_info(upper_dev, "proxy_wifi: MAC address update\n");
 		break;
 	}
 
 	return NOTIFY_DONE;
 }
 
-static struct notifier_block virt_wifi_notifier = {
-	.notifier_call = virt_wifi_event,
+static struct notifier_block proxy_wifi_notifier = {
+	.notifier_call = proxy_wifi_event,
 };
 
 /* Acquires and releases the rtnl lock. */
-static int __init virt_wifi_init_module(void)
+static int __init proxy_wifi_init_module(void)
 {
 	int err;
 
-	virt_wifi_command_wq = create_singlethread_workqueue("proxy_wifi");
-	if (!virt_wifi_command_wq) {
+	proxy_wifi_command_wq = create_singlethread_workqueue("proxy_wifi");
+	if (!proxy_wifi_command_wq) {
 		pr_err("Failed creating work queue\n");
 		return -EINVAL;
 	}
 
-	err = register_netdevice_notifier(&virt_wifi_notifier);
+	err = register_netdevice_notifier(&proxy_wifi_notifier);
 	if (err)
 		return err;
 
 	err = -ENOMEM;
-	common_wiphy = virt_wifi_make_wiphy();
+	common_wiphy = proxy_wifi_make_wiphy();
 	if (!common_wiphy)
 		goto notifier;
 
-	err = rtnl_link_register(&virt_wifi_link_ops);
+	err = rtnl_link_register(&proxy_wifi_link_ops);
 	if (err)
 		goto destroy_wiphy;
 
 	return 0;
 
 destroy_wiphy:
-	virt_wifi_destroy_wiphy(common_wiphy);
+	proxy_wifi_destroy_wiphy(common_wiphy);
 notifier:
-	unregister_netdevice_notifier(&virt_wifi_notifier);
+	unregister_netdevice_notifier(&proxy_wifi_notifier);
 	return err;
 }
 
 /* Acquires and releases the rtnl lock. */
-static void __exit virt_wifi_cleanup_module(void)
+static void __exit proxy_wifi_cleanup_module(void)
 {
-	destroy_workqueue(virt_wifi_command_wq);
+	destroy_workqueue(proxy_wifi_command_wq);
 
 	/* Will delete any devices that depend on the wiphy. */
-	rtnl_link_unregister(&virt_wifi_link_ops);
-	virt_wifi_destroy_wiphy(common_wiphy);
-	unregister_netdevice_notifier(&virt_wifi_notifier);
+	rtnl_link_unregister(&proxy_wifi_link_ops);
+	proxy_wifi_destroy_wiphy(common_wiphy);
+	unregister_netdevice_notifier(&proxy_wifi_notifier);
 }
 
-module_init(virt_wifi_init_module);
-module_exit(virt_wifi_cleanup_module);
+module_init(proxy_wifi_init_module);
+module_exit(proxy_wifi_cleanup_module);
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Guillaume Hetier <guhetier@microsoft.com>");
