@@ -11,13 +11,17 @@
 
 #include <net/cfg80211.h>
 #include <net/rtnetlink.h>
+#include <net/sock.h>
 #include <linux/etherdevice.h>
 #include <linux/math64.h>
 #include <linux/module.h>
 
+#include <linux/list.h>
 #include <linux/vm_sockets.h>
 #include <linux/net.h>
 #include <linux/skbuff.h>
+#include <linux/sockptr.h>
+#include <linux/time_types.h>
 
 /* Single threaded workqueue to serialize all exchanges with the host */
 static struct workqueue_struct *proxy_wifi_command_wq;
@@ -106,6 +110,7 @@ struct proxy_wifi_signal_quality_notif {
 } __packed;
 
 struct proxy_wifi_msg {
+	struct list_head link;
 	struct proxy_wifi_hdr hdr;
 	u8 *body;
 };
@@ -417,6 +422,9 @@ error:
 	return message;
 }
 
+DEFINE_RWLOCK(proxy_wifi_connection_lock);
+DEFINE_RWLOCK(proxy_wifi_notif_lock);
+
 struct connection_state {
 	u32 tx_packets;
 	u32 tx_failed;
@@ -430,15 +438,15 @@ struct connection_state {
 	u64 session_id;
 };
 
-DEFINE_RWLOCK(proxy_wifi_connection_lock);
-
 struct proxy_wifi_netdev_priv {
 	struct work_struct connect;
 	struct work_struct disconnect;
+	struct work_struct handle_notif;
+	struct task_struct *notif_thread;
 	struct net_device *lowerdev;
 	struct net_device *upperdev;
-	struct socket *notification_socket;
-	struct delayed_work notifications_work;
+	/* Protected by `proxy_wifi_notif_lock */
+	struct list_head pending_notifs;
 	/* Protected by rtnl lock */
 	bool is_up;
 	/* Protected by rtnl lock */
@@ -449,6 +457,64 @@ struct proxy_wifi_netdev_priv {
 	unsigned int request_port;
 	unsigned int notification_port;
 };
+
+static void list_queue_msg(struct proxy_wifi_msg *msg, struct list_head *list)
+{
+	list_add_tail(&msg->link, list);
+}
+
+static struct proxy_wifi_msg *list_pop_msg(struct list_head *list)
+{
+	struct proxy_wifi_msg *msg = NULL;
+
+	msg = list_first_entry_or_null(list, struct proxy_wifi_msg, link);
+	if (msg)
+		list_del_init(&msg->link);
+	return msg;
+}
+
+static void list_clear_msg(struct list_head *list)
+{
+	struct list_head *pos = NULL;
+	struct list_head *n = NULL;
+	struct proxy_wifi_msg *msg = NULL;
+
+	list_for_each_safe(pos, n, list) {
+		list_del(pos);
+		msg = list_entry(pos, struct proxy_wifi_msg, link);
+		kfree(msg->body);
+		kfree(msg);
+	}
+}
+
+static void queue_notification(struct proxy_wifi_netdev_priv *priv,
+			       struct proxy_wifi_msg *msg)
+{
+	write_lock(&proxy_wifi_notif_lock);
+	list_queue_msg(msg, &priv->pending_notifs);
+	queue_work(proxy_wifi_command_wq, &priv->handle_notif);
+	write_unlock(&proxy_wifi_notif_lock);
+}
+
+static struct proxy_wifi_msg *
+pop_notification(struct proxy_wifi_netdev_priv *priv)
+{
+	struct proxy_wifi_msg *msg = NULL;
+
+	write_lock(&proxy_wifi_notif_lock);
+	msg = list_pop_msg(&priv->pending_notifs);
+	write_unlock(&proxy_wifi_notif_lock);
+	return msg;
+}
+
+static void flush_notifications(struct proxy_wifi_netdev_priv *priv)
+{
+	cancel_work_sync(&priv->handle_notif);
+
+	write_lock(&proxy_wifi_notif_lock);
+	list_clear_msg(&priv->pending_notifs);
+	write_unlock(&proxy_wifi_notif_lock);
+}
 
 static void proxy_wifi_disconnect_finalize(struct net_device *netdev,
 					   u16 reason_code);
@@ -508,51 +574,123 @@ handle_signal_quality_notification(struct proxy_wifi_netdev_priv *priv,
 	write_unlock(&proxy_wifi_connection_lock);
 }
 
-static void receive_notification(struct proxy_wifi_netdev_priv *priv,
-				 struct socket *socket)
+static void proxy_wifi_handle_notifications(struct work_struct *work)
+{
+	struct proxy_wifi_msg *msg = NULL;
+	struct proxy_wifi_netdev_priv *priv =
+		container_of(work, struct proxy_wifi_netdev_priv, handle_notif);
+
+	for (;;) {
+		msg = pop_notification(priv);
+		if (!msg)
+			/* No more notifications to process */
+			return;
+
+		/* Dispatch the notification */
+		if (msg->hdr.operation == WIFI_NOTIF_DISCONNECTED)
+			handle_disconnected_notification(priv, *msg);
+		else if (msg->hdr.operation == WIFI_NOTIF_SIGNAL_QUALITY)
+			handle_signal_quality_notification(priv, *msg);
+		else
+			netdev_warn(priv->upperdev,
+				    "proxy_wifi: Received an unknown notification\n");
+		kfree(msg->body);
+		kfree(msg);
+	}
+}
+
+static int receive_notification(struct proxy_wifi_netdev_priv *priv,
+				struct socket *socket)
 {
 	int error = 0;
-	struct proxy_wifi_msg message = { 0 };
+	struct proxy_wifi_msg *msg = NULL;
 
-	error = receive_proxy_wifi_message(socket, &message);
+	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
+	if (!msg)
+		return -ENOMEM;
+
+	error = receive_proxy_wifi_message(socket, msg);
 	if (error < 0) {
 		netdev_err(priv->upperdev,
 			   "proxy_wifi: Failed to receive a notification, error %d\n",
 			   error);
-		goto out_free;
+		kfree(msg);
+		return error;
 	}
 
 	netdev_dbg(priv->upperdev, "proxy_wifi: Got a notification, type %d\n",
-		   message.hdr.operation);
+		   msg->hdr.operation);
 
-	// Dispatch the notification
-	if (message.hdr.operation == WIFI_NOTIF_DISCONNECTED)
-		handle_disconnected_notification(priv, message);
-	else if (message.hdr.operation == WIFI_NOTIF_SIGNAL_QUALITY)
-		handle_signal_quality_notification(priv, message);
-	else
-		netdev_warn(priv->upperdev,
-			    "proxy_wifi: Received an unknown notification\n");
-
-out_free:
-	kfree(message.body);
+	/* Queue the notif to handle it synchronously by the workqueue */
+	queue_notification(priv, msg);
+	return 0;
 }
 
-static void poll_notifications(struct work_struct *work)
+static int create_listening_socket(int port, struct socket **listen_socket)
 {
 	int error = 0;
-	struct socket *connect_socket = NULL;
-	struct proxy_wifi_netdev_priv *priv =
-		container_of(work,
-			     struct proxy_wifi_netdev_priv,
-			     notifications_work.work);
+	struct sockaddr_vm addr = { .svm_family = AF_VSOCK,
+				    .svm_port = port,
+				    .svm_cid = VMADDR_CID_ANY };
+	struct __kernel_sock_timeval timeout = {0, 10000}; /* 10 ms */
+	sockptr_t timeout_ptr = { .kernel = &timeout, .is_kernel = true };
+	struct socket *socket;
 
-	for (;;) {
-		error = kernel_accept(priv->notification_socket,
-				      &connect_socket, SOCK_NONBLOCK);
-		if (error == -EWOULDBLOCK) {
-			// We are done processing incoming notifications
-			break;
+	*listen_socket = NULL;
+	error = sock_create_kern(&init_net, AF_VSOCK, SOCK_STREAM, 0, &socket);
+	if (error != 0) {
+		pr_err("proxy_wifi: Failed to create the notification socket, error %d",
+		       error);
+		return error;
+	}
+
+	error = sock_setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO_NEW,
+				timeout_ptr, sizeof(timeout));
+	if (error != 0) {
+		pr_err("proxy_wifi: Failed to set a timeout on the notification socket, error %d",
+		       error);
+		goto out_release_sock;
+	}
+
+	error = kernel_bind(socket, (struct sockaddr *)&addr, sizeof(addr));
+	if (error != 0) {
+		pr_err("proxy_wifi: Failed to bind the notification socket, error %d",
+		       error);
+		goto out_release_sock;
+	}
+
+	error = kernel_listen(socket, INT_MAX);
+	if (error != 0) {
+		pr_err("proxy_wifi: Failed to listen on the notification socket, error %d",
+		       error);
+		goto out_release_sock;
+	}
+
+	*listen_socket = socket;
+	return 0;
+
+out_release_sock:
+	sock_release(socket);
+	return error;
+}
+
+static int listen_notifications(void *context)
+{
+	int error = 0;
+	struct socket *listen_socket = NULL;
+	struct socket *connect_socket = NULL;
+	struct proxy_wifi_netdev_priv *priv = context;
+
+	error = create_listening_socket(priv->notification_port, &listen_socket);
+	if (error != 0)
+		return error;
+
+	while (!kthread_should_stop()) {
+		/* Listen socket configured with a timeout */
+		error = kernel_accept(listen_socket, &connect_socket, 0);
+		if (error == -EWOULDBLOCK || error == -EAGAIN) {
+			error = 0;
+			continue;
 		} else if (error != 0) {
 			netdev_err(priv->upperdev,
 				   "proxy_wifi: Failed to accept a connection, error %d",
@@ -560,80 +698,59 @@ static void poll_notifications(struct work_struct *work)
 			break;
 		}
 
-		receive_notification(priv, connect_socket);
+		error = receive_notification(priv, connect_socket);
+		if (error != 0) {
+			netdev_warn(priv->upperdev,
+				    "proxy_wifi: Failed to receive a notification, error %d",
+				    error);
+			error = 0;
+		}
 
 		kernel_sock_shutdown(connect_socket, SHUT_RDWR);
 		sock_release(connect_socket);
 		connect_socket = NULL;
 	}
 
-	// Re-arm the notification work
-	queue_delayed_work(proxy_wifi_command_wq, &priv->notifications_work,
-			   10 * min(1, HZ / 1000));
+	sock_release(listen_socket);
+	return error;
 }
 
 static int
-setup_notification_channel(struct proxy_wifi_netdev_priv *netdev_priv,
-			   unsigned int port)
+setup_notification_channel(struct proxy_wifi_netdev_priv *netdev_priv)
 {
-	int error = 0;
-	struct sockaddr_vm addr = { .svm_family = AF_VSOCK,
-				    .svm_port = port,
-				    .svm_cid = VMADDR_CID_ANY };
+	struct task_struct *thread_res = NULL;
 
-	error = sock_create_kern(&init_net, AF_VSOCK, SOCK_STREAM, 0,
-				 &netdev_priv->notification_socket);
-	if (error != 0) {
+	/* Start the notification handling thread */
+	thread_res = kthread_create(listen_notifications, netdev_priv,
+				    "proxy_wifi notif");
+	if (IS_ERR(thread_res)) {
 		netdev_err(netdev_priv->upperdev,
-			   "proxy_wifi: Failed to create the notification socket, error %d",
-			   error);
-		return error;
+			   "proxy_wifi: Failed to create the notif thread, error %ld",
+			   PTR_ERR(thread_res));
+		return PTR_ERR(thread_res);
 	}
 
-	error = kernel_bind(netdev_priv->notification_socket,
-			    (struct sockaddr *)&addr, sizeof(addr));
-	if (error != 0) {
-		netdev_err(netdev_priv->upperdev,
-			   "proxy_wifi: Failed to bind the notification socket, error %d",
-			   error);
-		goto out_release_sock;
-	}
-
-	error = kernel_listen(netdev_priv->notification_socket, INT_MAX);
-	if (error != 0) {
-		netdev_err(netdev_priv->upperdev,
-			   "proxy_wifi: Failed to listen on the notification socket, error %d",
-			   error);
-		goto out_release_sock;
-	}
-
-	// Start the notification handling thread
-	INIT_DELAYED_WORK(&netdev_priv->notifications_work, poll_notifications);
-	if (!queue_delayed_work(proxy_wifi_command_wq,
-				&netdev_priv->notifications_work,
-				10 * HZ / 1000)) {
-		netdev_err(netdev_priv->upperdev,
-			   "proxy_wifi: Failed to start the notification work");
-		error = -EINVAL;
-		goto out_release_sock;
-	}
-
+	netdev_priv->notif_thread = ERR_CAST(thread_res);
+	/* `put_task_struct` in `stop_notification_channel`.
+	 * Keeep the task_struct alive until `kthread_stop` if the thread exit early
+	 */
+	get_task_struct(netdev_priv->notif_thread);
+	wake_up_process(netdev_priv->notif_thread);
 	return 0;
-
-out_release_sock:
-	sock_release(netdev_priv->notification_socket);
-	return error;
 }
 
 static void
 stop_notification_channel(struct proxy_wifi_netdev_priv *netdev_priv)
 {
-	netdev_dbg(netdev_priv->upperdev,
-		   "proxy_wifi: Waiting for notification work completion...");
-	cancel_delayed_work_sync(&netdev_priv->notifications_work);
+	if (netdev_priv->notif_thread) {
+		netdev_dbg(netdev_priv->upperdev,
+			   "proxy_wifi: Waiting for notification thread completion...");
+		kthread_stop(netdev_priv->notif_thread);
+		put_task_struct(netdev_priv->notif_thread);
+		netdev_priv->notif_thread = NULL;
+	}
 
-	sock_release(netdev_priv->notification_socket);
-	netdev_priv->notification_socket = NULL;
+	flush_notifications(netdev_priv);
 }
 
 static struct wiphy *common_wiphy;
@@ -656,81 +773,21 @@ u32 cipher_suites[] = {
 u32 akm_suites[] = { WLAN_AKM_SUITE_PSK, WLAN_AKM_SUITE_SAE };
 
 static struct ieee80211_channel channels_2ghz[] = {
-	{
-		.band = NL80211_BAND_2GHZ,
-		.center_freq = 2412,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_2GHZ,
-		.center_freq = 2417,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_2GHZ,
-		.center_freq = 2422,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_2GHZ,
-		.center_freq = 2427,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_2GHZ,
-		.center_freq = 2432,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_2GHZ,
-		.center_freq = 2437,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_2GHZ,
-		.center_freq = 2442,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_2GHZ,
-		.center_freq = 2447,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_2GHZ,
-		.center_freq = 2452,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_2GHZ,
-		.center_freq = 2457,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_2GHZ,
-		.center_freq = 2462,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_2GHZ,
-		.center_freq = 2467,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_2GHZ,
-		.center_freq = 2472,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_2GHZ,
-		.center_freq = 2477,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_2GHZ,
-		.center_freq = 2484,
-		.max_power = 20,
-	},
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2412, .max_power = 20, },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2417, .max_power = 20, },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2422, .max_power = 20, },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2427, .max_power = 20, },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2432, .max_power = 20, },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2437, .max_power = 20, },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2442, .max_power = 20, },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2447, .max_power = 20, },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2452, .max_power = 20, },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2457, .max_power = 20, },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2462, .max_power = 20, },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2467, .max_power = 20, },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2472, .max_power = 20, },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2477, .max_power = 20, },
+	{ .band = NL80211_BAND_2GHZ, .center_freq = 2484, .max_power = 20, },
 };
 
 static struct ieee80211_rate bitrates_2ghz[] = {
@@ -762,286 +819,62 @@ static struct ieee80211_supported_band band_2ghz = {
 };
 
 static struct ieee80211_channel channels_5ghz[] = {
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5160,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5170,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5180,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5190,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5200,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5210,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5220,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5230,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5240,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5250,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5260,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5270,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5280,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5290,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5300,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5310,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5320,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5340,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5480,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5500,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5510,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5520,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5530,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5540,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5550,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5560,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5570,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5580,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5590,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5600,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5610,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5620,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5630,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5640,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5660,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5670,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5680,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5690,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5700,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5710,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5720,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5745,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5755,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5765,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5775,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5785,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5795,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5805,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5815,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5825,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5835,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5845,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5855,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5865,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5875,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_5GHZ,
-		.center_freq = 5885,
-		.max_power = 20,
-	},
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5160, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5170, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5180, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5190, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5200, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5210, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5220, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5230, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5240, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5250, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5260, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5270, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5280, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5290, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5300, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5310, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5320, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5340, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5480, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5500, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5510, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5520, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5530, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5540, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5550, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5560, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5570, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5580, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5590, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5600, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5610, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5620, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5630, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5640, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5660, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5670, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5680, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5690, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5700, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5710, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5720, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5745, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5755, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5765, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5775, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5785, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5795, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5805, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5815, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5825, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5835, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5845, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5855, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5865, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5875, .max_power = 20, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5885, .max_power = 20, },
 };
 
 static struct ieee80211_rate bitrates_5ghz[] = {
@@ -1111,301 +944,65 @@ static struct ieee80211_supported_band band_5ghz = {
 };
 
 static struct ieee80211_channel channels_6ghz[] = {
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 5955,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 5975,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 5995,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6015,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6035,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6055,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6075,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6095,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6115,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6135,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6155,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6175,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6195,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6215,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6235,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6255,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6275,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6295,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6315,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6335,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6355,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6375,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6395,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6415,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6435,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6455,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6475,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6495,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6515,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6535,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6555,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6575,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6595,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6615,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6635,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6655,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6675,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6695,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6715,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6735,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6755,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6775,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6795,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6815,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6835,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6855,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6875,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6895,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6915,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6935,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6955,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6975,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 6995,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 7015,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 7035,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 7055,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 7075,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 7095,
-		.max_power = 20,
-	},
-	{
-		.band = NL80211_BAND_6GHZ,
-		.center_freq = 7115,
-		.max_power = 20,
-	},
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 5955, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 5975, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 5995, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6015, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6035, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6055, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6075, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6095, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6115, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6135, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6155, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6175, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6195, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6215, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6235, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6255, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6275, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6295, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6315, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6335, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6355, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6375, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6395, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6415, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6435, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6455, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6475, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6495, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6515, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6535, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6555, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6575, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6595, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6615, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6635, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6655, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6675, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6695, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6715, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6735, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6755, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6775, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6795, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6815, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6835, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6855, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6875, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6895, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6915, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6935, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6955, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6975, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 6995, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 7015, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 7035, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 7055, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 7075, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 7095, .max_power = 20, },
+	{ .band = NL80211_BAND_6GHZ, .center_freq = 7115, .max_power = 20, },
 };
 
 static struct ieee80211_rate bitrates_6ghz[] = {
@@ -1414,7 +1011,7 @@ static struct ieee80211_rate bitrates_6ghz[] = {
 	{ .bitrate = 480 }, { .bitrate = 540 },
 };
 
-// Taken from mac80211_hwsim.
+/* Taken from mac80211_hwsim. */
 static const struct ieee80211_sband_iftype_data iftype_data_6ghz[] = {
 	{
 		.types_mask = BIT(NL80211_IFTYPE_STATION),
@@ -1525,7 +1122,7 @@ static int report_scanned_network(struct wiphy *wiphy,
 static bool is_bss_valid(const struct proxy_wifi_bss *bss,
 			 const struct proxy_wifi_msg *message)
 {
-	// Check the bss and its IEs are contained in the message body
+	/* Check the bss and its IEs are contained in the message body */
 	return (u8 *)bss >= message->body &&
 	       (u8 *)bss + bss->ie_offset + bss->ie_size <=
 		       (u8 *)message->body + message->hdr.size;
@@ -1956,19 +1553,15 @@ static struct wiphy *proxy_wifi_make_wiphy(void)
 
 	wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
 
-	// Set security capabilities
+	/* Set security capabilities */
 	wiphy->akm_suites = akm_suites;
 	wiphy->n_akm_suites = ARRAY_SIZE(akm_suites);
 	wiphy->cipher_suites = cipher_suites;
 	wiphy->n_cipher_suites = ARRAY_SIZE(cipher_suites);
 
-	// Offload handshakes (the host take care of it)
+	/* Offload handshakes (the host take care of it) */
 	wiphy_ext_feature_set(wiphy,
 			      NL80211_EXT_FEATURE_4WAY_HANDSHAKE_STA_PSK);
-
-	// TODO guhetier: Enable or remove depending on if we can get SAE offload
-	// wiphy->features |= NL80211_FEATURE_SAE;
-	// wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_SAE_OFFLOAD);
 
 	priv = wiphy_priv(wiphy);
 	priv->being_deleted = false;
@@ -2184,6 +1777,9 @@ static int proxy_wifi_newlink(struct net *src_net, struct net_device *dev,
 	priv->connect_req_ctx = NULL;
 	INIT_WORK(&priv->connect, proxy_wifi_connect_complete);
 	INIT_WORK(&priv->disconnect, proxy_wifi_disconnect_complete);
+	INIT_WORK(&priv->handle_notif, proxy_wifi_handle_notifications);
+	INIT_LIST_HEAD(&priv->pending_notifs);
+	priv->notif_thread = NULL;
 
 	write_lock(&proxy_wifi_connection_lock);
 	priv->connection.is_connected = false;
@@ -2197,7 +1793,7 @@ static int proxy_wifi_newlink(struct net *src_net, struct net_device *dev,
 	priv->request_port = PROXY_WIFI_REQUEST_PORT;
 	priv->notification_port = PROXY_WIFI_NOTIFICATION_PORT;
 
-	err = setup_notification_channel(priv, priv->notification_port);
+	err = setup_notification_channel(priv);
 	if (err) {
 		dev_err(&priv->lowerdev->dev,
 			"proxy_wifi: can't start the notification channel: %d\n",
@@ -2238,7 +1834,7 @@ static void proxy_wifi_dellink(struct net_device *dev, struct list_head *head)
 
 	netif_carrier_off(dev);
 
-	// Stop handling notifications
+	/* Stop handling notifications. */
 	stop_notification_channel(priv);
 
 	netdev_rx_handler_unregister(priv->lowerdev);
