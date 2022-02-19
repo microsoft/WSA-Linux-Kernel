@@ -40,6 +40,7 @@ enum proxy_wifi_operation {
 	WIFI_OP_DISCONNECT_RESPONSE,
 	WIFI_NOTIF_DISCONNECTED,
 	WIFI_NOTIF_SIGNAL_QUALITY,
+	WIFI_NOTIF_SCAN_RESULTS,
 	WIFI_OP_MAX
 };
 
@@ -71,6 +72,7 @@ struct proxy_wifi_scan_request {
 } __packed;
 
 struct proxy_wifi_scan_response {
+	u8 scan_complete;
 	u32 num_bss;
 	u32 total_size;
 	struct proxy_wifi_bss bss[];
@@ -574,6 +576,107 @@ handle_signal_quality_notification(struct proxy_wifi_netdev_priv *priv,
 	write_unlock(&proxy_wifi_connection_lock);
 }
 
+// TODO guhetier: move to a more logical spot
+static struct wiphy *common_wiphy;
+
+// TODO guhetier: move to a more logical spot
+struct proxy_wifi_wiphy_priv {
+	struct work_struct scan_result;
+	/* Not protected but access are sequentials */
+	struct cfg80211_scan_request *scan_request;
+	/* Protected by rtnl lock */
+	bool being_deleted;
+};
+
+
+// TODO guhetier: move to a more logical spot
+static bool is_bss_valid(const struct proxy_wifi_bss *bss,
+			 const struct proxy_wifi_msg *message)
+{
+	/* Check the bss and its IEs are contained in the message body */
+	return (u8 *)bss >= message->body &&
+	       (u8 *)bss + bss->ie_offset + bss->ie_size <=
+		       (u8 *)message->body + message->hdr.size;
+}
+
+// TODO guhetier: move to a more logical spot
+static int report_scanned_network(struct wiphy *wiphy,
+				  struct proxy_wifi_bss *bss)
+{
+	struct cfg80211_bss *informed_bss = NULL;
+	const u64 tsf = div_u64(ktime_get_boottime_ns(), 1000);
+	struct ieee80211_channel *channel = NULL;
+
+	channel = ieee80211_get_channel_khz(wiphy, bss->channel_center_freq);
+	if (!channel) {
+		wiphy_warn(wiphy,
+			 "proxy_wifi: Unsupported frequency %d, ignoring scan result\n",
+			 bss->channel_center_freq);
+		return -EINVAL;
+	}
+
+	informed_bss =
+		cfg80211_inform_bss(wiphy, channel, CFG80211_BSS_FTYPE_PRESP,
+				    bss->bssid, tsf, bss->capabilities,
+				    bss->beacon_interval,
+				    (u8 *)bss + bss->ie_offset, bss->ie_size,
+				    bss->rssi * 100, /* rssi expected in mBm */
+				    GFP_KERNEL);
+
+	cfg80211_put_bss(wiphy, informed_bss);
+	return 0;
+}
+
+static void
+handle_scan_results_notification(struct proxy_wifi_netdev_priv *priv,
+				 struct proxy_wifi_msg message)
+{
+	struct proxy_wifi_scan_response *scan_response = NULL;
+	int i = 0;
+	struct proxy_wifi_bss *bss = NULL;
+	struct cfg80211_scan_info scan_info = { .aborted = false };
+
+	/* TODO guhetier: Create a decent proxy_wifi context reference the netdev and the wiphy */
+	struct wiphy *wiphy = common_wiphy;
+	struct proxy_wifi_wiphy_priv *w_priv =
+		(struct proxy_wifi_wiphy_priv *)wiphy->priv;
+
+	netdev_info(priv->upperdev,
+		   "proxy_wifi: Handling a scan_response notification\n");
+
+	if (message.hdr.size < sizeof(struct proxy_wifi_scan_response) ||
+	    !message.body) {
+		netdev_err(priv->upperdev,
+			   "proxy_wifi: Invalid size for a scan results notification: %d bytes\n",
+			   message.hdr.size);
+		return;
+	}
+	scan_response = (struct proxy_wifi_scan_response *)message.body;
+
+	/* TODO guhetier: Factor in a function */
+	netdev_info(priv->upperdev, "proxy_wifi: Received %u scan results\n",
+		    scan_response->num_bss);
+
+	for (i = 0; i < scan_response->num_bss; i++) {
+		bss = &scan_response->bss[i];
+		if (!is_bss_valid(bss, &message)) {
+			netdev_warn(priv->upperdev,
+				    "proxy_wifi: Ignoring an invalid scan result (Index %d)",
+				    i);
+			continue;
+		}
+
+		report_scanned_network(wiphy, &scan_response->bss[i]);
+	}
+
+	// TODO guhetier: Need a lock here
+	if (scan_response->scan_complete && w_priv->scan_request) {
+		/* Schedules work which acquires and releases the rtnl lock. */
+		cfg80211_scan_done(w_priv->scan_request, &scan_info);
+		w_priv->scan_request = NULL;
+	}
+}
+
 static void proxy_wifi_handle_notifications(struct work_struct *work)
 {
 	struct proxy_wifi_msg *msg = NULL;
@@ -591,6 +694,9 @@ static void proxy_wifi_handle_notifications(struct work_struct *work)
 			handle_disconnected_notification(priv, *msg);
 		else if (msg->hdr.operation == WIFI_NOTIF_SIGNAL_QUALITY)
 			handle_signal_quality_notification(priv, *msg);
+		// TODO guhetier: Use scan notif properly
+		else if (msg->hdr.operation == WIFI_OP_SCAN_RESPONSE)
+			handle_scan_results_notification(priv, *msg);
 		else
 			netdev_warn(priv->upperdev,
 				    "proxy_wifi: Received an unknown notification\n");
@@ -752,16 +858,6 @@ stop_notification_channel(struct proxy_wifi_netdev_priv *netdev_priv)
 
 	flush_notifications(netdev_priv);
 }
-
-static struct wiphy *common_wiphy;
-
-struct proxy_wifi_wiphy_priv {
-	struct work_struct scan_result;
-	/* Not protected but access are sequentials */
-	struct cfg80211_scan_request *scan_request;
-	/* Protected by rtnl lock */
-	bool being_deleted;
-};
 
 u32 cipher_suites[] = {
 	WLAN_CIPHER_SUITE_CCMP,		WLAN_CIPHER_SUITE_GCMP,
@@ -1096,42 +1192,6 @@ static int proxy_wifi_scan(struct wiphy *wiphy,
 	return 0;
 }
 
-static int report_scanned_network(struct wiphy *wiphy,
-				  struct proxy_wifi_bss *bss)
-{
-	struct cfg80211_bss *informed_bss = NULL;
-	const u64 tsf = div_u64(ktime_get_boottime_ns(), 1000);
-	struct ieee80211_channel *channel = NULL;
-
-	channel = ieee80211_get_channel_khz(wiphy, bss->channel_center_freq);
-	if (!channel) {
-		dev_warn(&wiphy->dev,
-			 "proxy_wifi: Unsupported frequency %d, ignoring scan result\n",
-			 bss->channel_center_freq);
-		return -EINVAL;
-	}
-
-	informed_bss =
-		cfg80211_inform_bss(wiphy, channel, CFG80211_BSS_FTYPE_PRESP,
-				    bss->bssid, tsf, bss->capabilities,
-				    bss->beacon_interval,
-				    (u8 *)bss + bss->ie_offset, bss->ie_size,
-				    bss->rssi * 100, /* rssi expected in mBm */
-				    GFP_KERNEL);
-
-	cfg80211_put_bss(wiphy, informed_bss);
-	return 0;
-}
-
-static bool is_bss_valid(const struct proxy_wifi_bss *bss,
-			 const struct proxy_wifi_msg *message)
-{
-	/* Check the bss and its IEs are contained in the message body */
-	return (u8 *)bss >= message->body &&
-	       (u8 *)bss + bss->ie_offset + bss->ie_size <=
-		       (u8 *)message->body + message->hdr.size;
-}
-
 /* Acquires and releases the rdev BSS lock. */
 static void proxy_wifi_scan_result(struct work_struct *work)
 {
@@ -1181,9 +1241,13 @@ static void proxy_wifi_scan_result(struct work_struct *work)
 
 complete_scan:
 
-	/* Schedules work which acquires and releases the rtnl lock. */
-	cfg80211_scan_done(w_priv->scan_request, &scan_info);
-	w_priv->scan_request = NULL;
+	if (scan_info.aborted || (scan_response && scan_response->scan_complete)) {
+		/* Schedules work which acquires and releases the rtnl lock. */
+		cfg80211_scan_done(w_priv->scan_request, &scan_info);
+		w_priv->scan_request = NULL;
+	} else {
+		// TODO guhetier: Schedule a task to complete the scan after timeout
+	}
 	kfree(message.body);
 }
 
@@ -1196,6 +1260,7 @@ static void proxy_wifi_cancel_scan(struct wiphy *wiphy)
 	cancel_work_sync(&priv->scan_result);
 
 	/* Clean up dangling callbacks if necessary. */
+	// TODO guhetier: protect the scan request, concurrent access from notifs
 	if (priv->scan_request) {
 		wiphy_info(wiphy, "proxy_wifi: A scan request was canceled\n");
 		/* Schedules work which acquires and releases the rtnl lock. */
@@ -1408,17 +1473,22 @@ static void proxy_wifi_disconnect_finalize(struct net_device *netdev,
 {
 	struct proxy_wifi_netdev_priv *priv = netdev_priv(netdev);
 	bool is_connected = false;
+	bool connect_rq_pending = false;
 
 	write_lock(&proxy_wifi_connection_lock);
 	is_connected = priv->connection.is_connected;
+	connect_rq_pending = priv->connect_req_ctx != NULL;
 	priv->connection.is_connected = false;
 	write_unlock(&proxy_wifi_connection_lock);
 
-	if (is_connected) {
+	if (is_connected)
+		netif_carrier_off(netdev);
+
+	/* Don't indidicate the disconnection if another connection request has
+	 * been queued: it would be seen as a failure for the new request */
+	if (is_connected && !connect_rq_pending)
 		cfg80211_disconnected(netdev, reason_code, NULL, 0, true,
 				      GFP_KERNEL);
-		netif_carrier_off(netdev);
-	}
 }
 
 /* Subcall acquires the rdev event lock. */
@@ -1469,9 +1539,7 @@ static int proxy_wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 	is_connected = priv->connection.is_connected;
 	read_unlock(&proxy_wifi_connection_lock);
 
-	if (!is_connected) {
-		proxy_wifi_disconnect_finalize(netdev, reason_code);
-	} else {
+	if (is_connected) {
 		if (!queue_work(proxy_wifi_command_wq, &priv->disconnect))
 			return -EBUSY;
 	}
