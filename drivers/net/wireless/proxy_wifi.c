@@ -40,6 +40,7 @@ enum proxy_wifi_operation {
 	WIFI_OP_DISCONNECT_RESPONSE,
 	WIFI_NOTIF_DISCONNECTED,
 	WIFI_NOTIF_SIGNAL_QUALITY,
+	// TODO guhetier: Use or remove
 	WIFI_NOTIF_SCAN_RESULTS,
 	WIFI_OP_MAX
 };
@@ -117,6 +118,60 @@ struct proxy_wifi_msg {
 	u8 *body;
 };
 
+/* ------------- Driver private context ------------ */
+
+/* Lock to protect the proxy_wifi context */
+DEFINE_RWLOCK(proxy_wifi_connection_lock);
+
+/* Lock to protect access to the notification queue */
+DEFINE_RWLOCK(proxy_wifi_notif_lock);
+
+struct connection_state {
+	u32 tx_packets;
+	u32 tx_failed;
+	/* Protected by `proxy_wifi_connection_lock` */
+	u8 bssid[ETH_ALEN];
+	/* Protected by `proxy_wifi_connection_lock` */
+	bool is_connected;
+	/* Protected by `proxy_wifi_connection_lock` */
+	s8 signal;
+	/* Protected by `proxy_wifi_connection_lock` */
+	u64 session_id;
+};
+
+struct proxy_wifi_netdev_priv {
+	struct work_struct connect;
+	struct work_struct disconnect;
+	struct work_struct handle_notif;
+	struct task_struct *notif_thread;
+	struct net_device *lowerdev;
+	struct net_device *upperdev;
+	/* Protected by `proxy_wifi_notif_lock */
+	struct list_head pending_notifs;
+	/* Protected by rtnl lock */
+	bool is_up;
+	/* Protected by rtnl lock */
+	bool being_deleted;
+	struct connection_state connection;
+	/* Protected by `proxy_wifi_connection_lock` */
+	struct proxy_wifi_connect_request *connect_req_ctx;
+	unsigned int request_port;
+	unsigned int notification_port;
+};
+
+static struct wiphy *common_wiphy;
+
+struct proxy_wifi_wiphy_priv {
+	struct work_struct scan_result;
+	struct delayed_work scan_timeout;
+	/* Not protected but access are sequentials */
+	struct cfg80211_scan_request *scan_request;
+	/* Protected by rtnl lock */
+	bool being_deleted;
+};
+
+/* ------------- Message builder functions ------------ */
+
 static int
 build_scan_request_msg(struct proxy_wifi_msg *message,
 		       const struct cfg80211_scan_request *scan_params)
@@ -176,6 +231,8 @@ static int build_disconnect_request_msg(struct proxy_wifi_msg *message,
 
 	return 0;
 }
+
+/* --------------- Message sending functions --------------- */
 
 static int receive_bytes(struct socket *socket, size_t expected_size,
 			 u8 *buffer)
@@ -424,41 +481,7 @@ error:
 	return message;
 }
 
-DEFINE_RWLOCK(proxy_wifi_connection_lock);
-DEFINE_RWLOCK(proxy_wifi_notif_lock);
-
-struct connection_state {
-	u32 tx_packets;
-	u32 tx_failed;
-	/* Protected by `proxy_wifi_connection_lock` */
-	u8 bssid[ETH_ALEN];
-	/* Protected by `proxy_wifi_connection_lock` */
-	bool is_connected;
-	/* Protected by `proxy_wifi_connection_lock` */
-	s8 signal;
-	/* Protected by `proxy_wifi_connection_lock` */
-	u64 session_id;
-};
-
-struct proxy_wifi_netdev_priv {
-	struct work_struct connect;
-	struct work_struct disconnect;
-	struct work_struct handle_notif;
-	struct task_struct *notif_thread;
-	struct net_device *lowerdev;
-	struct net_device *upperdev;
-	/* Protected by `proxy_wifi_notif_lock */
-	struct list_head pending_notifs;
-	/* Protected by rtnl lock */
-	bool is_up;
-	/* Protected by rtnl lock */
-	bool being_deleted;
-	struct connection_state connection;
-	/* Protected by `proxy_wifi_connection_lock` */
-	struct proxy_wifi_connect_request *connect_req_ctx;
-	unsigned int request_port;
-	unsigned int notification_port;
-};
+/* ---- Notification queue ---- */
 
 static void list_queue_msg(struct proxy_wifi_msg *msg, struct list_head *list)
 {
@@ -517,6 +540,8 @@ static void flush_notifications(struct proxy_wifi_netdev_priv *priv)
 	list_clear_msg(&priv->pending_notifs);
 	write_unlock(&proxy_wifi_notif_lock);
 }
+
+/* ---- Notification handling ---- */
 
 static void proxy_wifi_disconnect_finalize(struct net_device *netdev,
 					   u16 reason_code);
@@ -577,19 +602,6 @@ handle_signal_quality_notification(struct proxy_wifi_netdev_priv *priv,
 }
 
 // TODO guhetier: move to a more logical spot
-static struct wiphy *common_wiphy;
-
-// TODO guhetier: move to a more logical spot
-struct proxy_wifi_wiphy_priv {
-	struct work_struct scan_result;
-	/* Not protected but access are sequentials */
-	struct cfg80211_scan_request *scan_request;
-	/* Protected by rtnl lock */
-	bool being_deleted;
-};
-
-
-// TODO guhetier: move to a more logical spot
 static bool is_bss_valid(const struct proxy_wifi_bss *bss,
 			 const struct proxy_wifi_msg *message)
 {
@@ -632,6 +644,7 @@ handle_scan_results_notification(struct proxy_wifi_netdev_priv *priv,
 				 struct proxy_wifi_msg message)
 {
 	struct proxy_wifi_scan_response *scan_response = NULL;
+	struct cfg80211_scan_request *scan_request = NULL;
 	int i = 0;
 	struct proxy_wifi_bss *bss = NULL;
 	struct cfg80211_scan_info scan_info = { .aborted = false };
@@ -653,7 +666,7 @@ handle_scan_results_notification(struct proxy_wifi_netdev_priv *priv,
 	}
 	scan_response = (struct proxy_wifi_scan_response *)message.body;
 
-	/* TODO guhetier: Factor in a function */
+	/* TODO guhetier: Factor in a function (shared with scan operation) */
 	netdev_info(priv->upperdev, "proxy_wifi: Received %u scan results\n",
 		    scan_response->num_bss);
 
@@ -669,11 +682,18 @@ handle_scan_results_notification(struct proxy_wifi_netdev_priv *priv,
 		report_scanned_network(wiphy, &scan_response->bss[i]);
 	}
 
-	// TODO guhetier: Need a lock here
-	if (scan_response->scan_complete && w_priv->scan_request) {
-		/* Schedules work which acquires and releases the rtnl lock. */
-		cfg80211_scan_done(w_priv->scan_request, &scan_info);
+	/* Complete the scan request if needed */
+	if (scan_response->scan_complete) {
+		write_lock(&proxy_wifi_connection_lock);
+		scan_request = w_priv->scan_request;
 		w_priv->scan_request = NULL;
+		write_unlock(&proxy_wifi_connection_lock);
+
+		if (scan_request) {
+			/* Schedules work which acquires and releases the rtnl lock. */
+			cfg80211_scan_done(scan_request, &scan_info);
+			cancel_delayed_work_sync(&w_priv->scan_timeout);
+		}
 	}
 }
 
@@ -859,7 +879,9 @@ stop_notification_channel(struct proxy_wifi_netdev_priv *netdev_priv)
 	flush_notifications(netdev_priv);
 }
 
-u32 cipher_suites[] = {
+/* ---- Driver config data ---- */
+
+static const u32 cipher_suites[] = {
 	WLAN_CIPHER_SUITE_CCMP,		WLAN_CIPHER_SUITE_GCMP,
 	WLAN_CIPHER_SUITE_CCMP_256,	WLAN_CIPHER_SUITE_GCMP_256,
 	WLAN_CIPHER_SUITE_AES_CMAC,	WLAN_CIPHER_SUITE_BIP_GMAC_128,
@@ -867,7 +889,7 @@ u32 cipher_suites[] = {
 	WLAN_CIPHER_SUITE_TKIP
 };
 
-u32 akm_suites[] = { WLAN_AKM_SUITE_PSK, WLAN_AKM_SUITE_SAE };
+static const u32 akm_suites[] = { WLAN_AKM_SUITE_PSK, WLAN_AKM_SUITE_SAE };
 
 static struct ieee80211_channel channels_2ghz[] = {
 	{ .band = NL80211_BAND_2GHZ, .center_freq = 2412, .max_power = 20, },
@@ -1175,21 +1197,25 @@ static struct ieee80211_supported_band band_6ghz = {
 static int proxy_wifi_scan(struct wiphy *wiphy,
 			   struct cfg80211_scan_request *request)
 {
+	int err = 0;
 	struct proxy_wifi_wiphy_priv *priv = wiphy_priv(wiphy);
 
 	wiphy_info(wiphy, "proxy_wifi: Starting a scan request\n");
 
-	if (priv->scan_request || priv->being_deleted)
-		return -EBUSY;
-
-	priv->scan_request = request;
-	if (!queue_work(proxy_wifi_command_wq, &priv->scan_result))
-	{
-		priv->scan_request = NULL;
-		return -EBUSY;
+	write_lock(&proxy_wifi_connection_lock);
+	if (priv->scan_request || priv->being_deleted) {
+		err = -EBUSY;
+	} else {
+		priv->scan_request = request;
+		if (!queue_work(proxy_wifi_command_wq, &priv->scan_result))
+		{
+			priv->scan_request = NULL;
+			err = -EBUSY;
+		}
 	}
 
-	return 0;
+	write_unlock(&proxy_wifi_connection_lock);
+	return err;
 }
 
 /* Acquires and releases the rdev BSS lock. */
@@ -1200,20 +1226,28 @@ static void proxy_wifi_scan_result(struct work_struct *work)
 	struct wiphy *wiphy = priv_to_wiphy(w_priv);
 	struct proxy_wifi_netdev_priv *n_priv =
 		netdev_priv(w_priv->scan_request->wdev->netdev);
+	struct cfg80211_scan_request *scan_request = NULL;
 	struct cfg80211_scan_info scan_info = { .aborted = false };
 	struct proxy_wifi_msg message = { 0 };
 	struct proxy_wifi_scan_response *scan_response = NULL;
 	struct proxy_wifi_bss *bss = NULL;
 	int i = 0;
+	bool set_scan_done = true;
 
-	if (!w_priv->scan_request) {
+	// TODO guhetier: Need to make sure the cancel won't delete the scan request while this run
+	// or the pointer become invalid...
+	read_lock(&proxy_wifi_connection_lock);
+	scan_request = w_priv->scan_request;
+	read_unlock(&proxy_wifi_connection_lock);
+
+	// TODO guhetier: Check this code when adding scan cancellation
+	if (!scan_request) {
 		netdev_err(n_priv->upperdev,
 			   "proxy_wifi: No scan parameters for a scan request\n");
-		scan_info.aborted = true;
-		goto complete_scan;
+		return;
 	}
 
-	message = scan_command(n_priv->request_port, w_priv->scan_request);
+	message = scan_command(n_priv->request_port, scan_request);
 	if (message.hdr.operation != WIFI_OP_SCAN_RESPONSE) {
 		netdev_err(n_priv->upperdev,
 			   "proxy_wifi: Invalid scan response (Operation: %d)\n",
@@ -1240,33 +1274,70 @@ static void proxy_wifi_scan_result(struct work_struct *work)
 	}
 
 complete_scan:
-
-	if (scan_info.aborted || (scan_response && scan_response->scan_complete)) {
+	/* More results are coming from the host through a notification. Ensure the scan will be complete in 10sec */
+	if (scan_response && !scan_response->scan_complete) {
+		if (queue_delayed_work(proxy_wifi_command_wq, &w_priv->scan_timeout, 10 * HZ))
+			set_scan_done = false;
+	}
+	
+	if (set_scan_done) {
 		/* Schedules work which acquires and releases the rtnl lock. */
-		cfg80211_scan_done(w_priv->scan_request, &scan_info);
+		cfg80211_scan_done(scan_request, &scan_info);
+		write_lock(&proxy_wifi_connection_lock);
 		w_priv->scan_request = NULL;
-	} else {
-		// TODO guhetier: Schedule a task to complete the scan after timeout
+		write_unlock(&proxy_wifi_connection_lock);
 	}
 	kfree(message.body);
+}
+
+static void proxy_wifi_scan_timeout(struct work_struct *work)
+{
+	struct proxy_wifi_wiphy_priv *priv = container_of(
+		work, struct proxy_wifi_wiphy_priv, scan_timeout.work);
+	struct wiphy *wiphy = priv_to_wiphy(priv);
+	struct cfg80211_scan_request *scan_request = NULL;
+	struct cfg80211_scan_info scan_info = { .aborted = false };
+
+	write_lock(&proxy_wifi_connection_lock);
+	scan_request = priv->scan_request;
+	priv->scan_request = NULL;
+	write_unlock(&proxy_wifi_connection_lock);
+
+	if (scan_request) {
+		wiphy_info(wiphy, "proxy_wifi: A scan request timed out\n");
+		/* Schedules work which acquires and releases the rtnl lock. */
+		cfg80211_scan_done(scan_request, &scan_info);
+	}
 }
 
 /* May acquire and release the rdev BSS lock. */
 static void proxy_wifi_cancel_scan(struct wiphy *wiphy)
 {
 	struct proxy_wifi_wiphy_priv *priv = wiphy_priv(wiphy);
+	struct cfg80211_scan_request *scan_request = NULL;
 	struct cfg80211_scan_info scan_info = { .aborted = true };
 
 	cancel_work_sync(&priv->scan_result);
 
-	/* Clean up dangling callbacks if necessary. */
-	// TODO guhetier: protect the scan request, concurrent access from notifs
-	if (priv->scan_request) {
+	/* Complete the scan request if needed (scan work didn't run or async completion) */
+	write_lock(&proxy_wifi_connection_lock);
+	scan_request = priv->scan_request;
+	priv->scan_request = NULL;
+	write_unlock(&proxy_wifi_connection_lock);
+
+	if (scan_request) {
 		wiphy_info(wiphy, "proxy_wifi: A scan request was canceled\n");
 		/* Schedules work which acquires and releases the rtnl lock. */
-		cfg80211_scan_done(priv->scan_request, &scan_info);
-		priv->scan_request = NULL;
+		cfg80211_scan_done(scan_request, &scan_info);
+		cancel_delayed_work_sync(&priv->scan_timeout);
 	}
+}
+
+/* May acquire and release the rdev BSS lock. */
+static void proxy_wifi_abort_scan(struct wiphy *wiphy, struct wireless_dev *dev)
+{
+	wiphy_info(wiphy, "proxy_wifi: Aborting a scan request\n");
+	proxy_wifi_cancel_scan(wiphy);
 }
 
 static int
@@ -1335,13 +1406,13 @@ static int proxy_wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 
 	wiphy_info(wiphy, "proxy_wifi: Starting a connection request\n");
 
-	if (priv->being_deleted || !priv->is_up)
-		return -EBUSY;
-
 	write_lock(&proxy_wifi_connection_lock);
 
-	kfree(priv->connect_req_ctx);
-	priv->connect_req_ctx = NULL;
+	if (priv->being_deleted || !priv->is_up || priv->connect_req_ctx) {
+		error = -EBUSY;
+		goto out_release_lock;
+	}
+
 	error = build_connect_request_cxt(sme, &priv->connect_req_ctx);
 	if (error < 0) {
 		wiphy_err(wiphy,
@@ -1360,7 +1431,6 @@ static int proxy_wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 		error = -EBUSY;
 		kfree(priv->connect_req_ctx);
 		priv->connect_req_ctx = NULL;
-		goto out_release_lock;
 	}
 
 out_release_lock:
@@ -1376,23 +1446,28 @@ static void proxy_wifi_connect_complete(struct work_struct *work)
 		container_of(work, struct proxy_wifi_netdev_priv, connect);
 	u16 status = WLAN_STATUS_UNSPECIFIED_FAILURE;
 	struct proxy_wifi_connect_request *connect_req_ctx = NULL;
+	bool is_up = false;
 	struct proxy_wifi_connect_response *connect_response = NULL;
 	struct proxy_wifi_msg message = { 0 };
-	u8 connected_bssid[ETH_ALEN];
 
 	write_lock(&proxy_wifi_connection_lock);
 	connect_req_ctx = priv->connect_req_ctx;
 	priv->connect_req_ctx = NULL;
+	is_up = priv->is_up;
 	write_unlock(&proxy_wifi_connection_lock);
 
 	if (!connect_req_ctx) {
 		netdev_err(priv->upperdev,
 			   "proxy_wifi: No connection parameters for a connection request\n");
-		goto complete_connect;
+		return;
 	}
 
-	if (!priv->is_up)
+	if (!is_up) {
+		netdev_err(
+			priv->upperdev,
+			"proxy_wifi: net_dev not up, aborting the connection request\n");
 		goto complete_connect;
+	}
 
 	message = connect_command(priv->request_port, connect_req_ctx);
 
@@ -1428,13 +1503,11 @@ static void proxy_wifi_connect_complete(struct work_struct *work)
 	}
 
 complete_connect:
-	read_lock(&proxy_wifi_connection_lock);
-	ether_addr_copy(connected_bssid, priv->connection.bssid);
-	read_unlock(&proxy_wifi_connection_lock);
-
 	/* Schedules an event that acquires the rtnl lock. */
-	cfg80211_connect_result(priv->upperdev, connected_bssid, NULL, 0, NULL,
-				0, status, GFP_KERNEL);
+	cfg80211_connect_result(priv->upperdev,
+				connect_response ? connect_response->bssid :
+							 connect_req_ctx->bssid,
+				NULL, 0, NULL, 0, status, GFP_KERNEL);
 
 	kfree(connect_req_ctx);
 	kfree(message.body);
@@ -1526,25 +1599,27 @@ static void proxy_wifi_disconnect_complete(struct work_struct *work)
 static int proxy_wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 				 u16 reason_code)
 {
+	int err = 0;
 	struct proxy_wifi_netdev_priv *priv = netdev_priv(netdev);
-	bool is_connected = false;
-
-	if (priv->being_deleted)
-		return -EBUSY;
 
 	wiphy_info(wiphy, "proxy_wifi: Starting a disconnect request\n");
 	proxy_wifi_cancel_connect(netdev);
 
 	read_lock(&proxy_wifi_connection_lock);
-	is_connected = priv->connection.is_connected;
+	if (priv->being_deleted) {
+		err = -EBUSY;
+	}
+	// TODO guhetier: Always queue, decide what to do when processing?
+	// Canceling here could cause long wait, so we would rather let a potential connection complete,
+	// then disconnect / do nothing depending on the status
+	// Could also set the context to null to "cancel" the connection without waiting for it
+	else if (priv->connection.is_connected) {
+		if (!queue_work(proxy_wifi_command_wq, &priv->disconnect))
+			err = -EBUSY;
+	}
 	read_unlock(&proxy_wifi_connection_lock);
 
-	if (is_connected) {
-		if (!queue_work(proxy_wifi_command_wq, &priv->disconnect))
-			return -EBUSY;
-	}
-
-	return 0;
+	return err;
 }
 
 /* Called with the rtnl lock held. */
@@ -1607,6 +1682,7 @@ static int proxy_wifi_dump_station(struct wiphy *wiphy, struct net_device *dev,
 
 static const struct cfg80211_ops proxy_wifi_cfg80211_ops = {
 	.scan = proxy_wifi_scan,
+	.abort_scan = proxy_wifi_abort_scan,
 
 	.connect = proxy_wifi_connect,
 	.disconnect = proxy_wifi_disconnect,
@@ -1652,6 +1728,7 @@ static struct wiphy *proxy_wifi_make_wiphy(void)
 	priv->being_deleted = false;
 	priv->scan_request = NULL;
 	INIT_WORK(&priv->scan_result, proxy_wifi_scan_result);
+	INIT_DELAYED_WORK(&priv->scan_timeout, proxy_wifi_scan_timeout);
 
 	err = wiphy_register(wiphy);
 	if (err < 0) {
@@ -1672,7 +1749,11 @@ static void proxy_wifi_destroy_wiphy(struct wiphy *wiphy)
 		return;
 
 	priv = wiphy_priv(wiphy);
+
+	write_lock(&proxy_wifi_connection_lock);
 	priv->being_deleted = true;
+	write_unlock(&proxy_wifi_connection_lock);
+
 	proxy_wifi_cancel_scan(wiphy);
 
 	if (wiphy->registered)
@@ -1709,7 +1790,9 @@ static int proxy_wifi_net_device_open(struct net_device *dev)
 	struct proxy_wifi_netdev_priv *priv = netdev_priv(dev);
 
 	netdev_info(dev, "proxy_wifi: underlying device up");
+	write_lock(&proxy_wifi_connection_lock);
 	priv->is_up = true;
+	write_unlock(&proxy_wifi_connection_lock);
 	return 0;
 }
 
@@ -1719,14 +1802,17 @@ static int proxy_wifi_net_device_stop(struct net_device *dev)
 	struct proxy_wifi_netdev_priv *n_priv = netdev_priv(dev);
 
 	netdev_info(dev, "proxy_wifi: underlying device down\n");
+
+	write_lock(&proxy_wifi_connection_lock);
 	n_priv->is_up = false;
+	write_unlock(&proxy_wifi_connection_lock);
 
 	if (!dev->ieee80211_ptr)
 		return 0;
 
+	netif_carrier_off(dev);
 	proxy_wifi_cancel_scan(dev->ieee80211_ptr->wiphy);
 	proxy_wifi_cancel_connect(dev);
-	netif_carrier_off(dev);
 
 	return 0;
 }
@@ -1734,7 +1820,6 @@ static int proxy_wifi_net_device_stop(struct net_device *dev)
 static int proxy_wifi_net_device_get_iflink(const struct net_device *dev)
 {
 	struct proxy_wifi_netdev_priv *priv = netdev_priv(dev);
-
 	return priv->lowerdev->ifindex;
 }
 
@@ -1908,10 +1993,14 @@ static void proxy_wifi_dellink(struct net_device *dev, struct list_head *head)
 
 	netdev_info(dev, "proxy_wifi: Delete link\n");
 
+	/* Reject incoming cfg80211 requests */
+	write_lock(&proxy_wifi_connection_lock);
+	priv->being_deleted = true;
+	write_unlock(&proxy_wifi_connection_lock);
+
 	if (dev->ieee80211_ptr)
 		proxy_wifi_cancel_scan(dev->ieee80211_ptr->wiphy);
 
-	priv->being_deleted = true;
 	proxy_wifi_cancel_connect(dev);
 
 	kfree(priv->connect_req_ctx);
