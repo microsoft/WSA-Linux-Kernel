@@ -124,6 +124,7 @@ struct proxy_wifi_msg {
 DEFINE_RWLOCK(proxy_wifi_connection_lock);
 
 /* Lock to protect access to the notification queue */
+// TODO guhetier: This doesn't need to be a read/write lock
 DEFINE_RWLOCK(proxy_wifi_notif_lock);
 
 struct connection_state {
@@ -140,35 +141,44 @@ struct connection_state {
 };
 
 struct proxy_wifi_netdev_priv {
-	struct work_struct connect;
-	struct work_struct disconnect;
-	struct work_struct handle_notif;
-	struct task_struct *notif_thread;
 	struct net_device *lowerdev;
 	struct net_device *upperdev;
-	/* Protected by `proxy_wifi_notif_lock */
-	struct list_head pending_notifs;
+
+	struct work_struct connect;
+	struct work_struct disconnect;
+
+	struct proxy_wifi_connect_request *connect_req_ctx;
+
 	/* Protected by rtnl lock */
 	bool is_up;
 	/* Protected by rtnl lock */
 	bool being_deleted;
 	struct connection_state connection;
-	/* Protected by `proxy_wifi_connection_lock` */
-	struct proxy_wifi_connect_request *connect_req_ctx;
-	unsigned int request_port;
-	unsigned int notification_port;
 };
 
-static struct wiphy *common_wiphy;
-
 struct proxy_wifi_wiphy_priv {
+	struct work_struct handle_notif;
+	struct task_struct *notif_thread;
+
+	/* Protected by `proxy_wifi_notif_lock */
+	struct list_head pending_notifs;
+
 	struct work_struct scan_result;
 	struct delayed_work scan_timeout;
 	/* Not protected but access are sequentials */
 	struct cfg80211_scan_request *scan_request;
+
+	unsigned int request_port;
+	unsigned int notification_port;
+
 	/* Protected by rtnl lock */
 	bool being_deleted;
+
+	/* Protectd by `proxy_wifi_connection_lock` */
+	struct net_device *netdev;
 };
+
+static struct wiphy *common_wiphy;
 
 /* ------------- Message builder functions ------------ */
 
@@ -512,32 +522,32 @@ static void list_clear_msg(struct list_head *list)
 	}
 }
 
-static void queue_notification(struct proxy_wifi_netdev_priv *n_priv,
+static void queue_notification(struct proxy_wifi_wiphy_priv *w_priv,
 			       struct proxy_wifi_msg *msg)
 {
 	write_lock(&proxy_wifi_notif_lock);
-	list_queue_msg(msg, &n_priv->pending_notifs);
-	queue_work(proxy_wifi_command_wq, &n_priv->handle_notif);
+	list_queue_msg(msg, &w_priv->pending_notifs);
+	queue_work(proxy_wifi_command_wq, &w_priv->handle_notif);
 	write_unlock(&proxy_wifi_notif_lock);
 }
 
 static struct proxy_wifi_msg *
-pop_notification(struct proxy_wifi_netdev_priv *n_priv)
+pop_notification(struct proxy_wifi_wiphy_priv *w_priv)
 {
 	struct proxy_wifi_msg *msg = NULL;
 
 	write_lock(&proxy_wifi_notif_lock);
-	msg = list_pop_msg(&n_priv->pending_notifs);
+	msg = list_pop_msg(&w_priv->pending_notifs);
 	write_unlock(&proxy_wifi_notif_lock);
 	return msg;
 }
 
-static void flush_notifications(struct proxy_wifi_netdev_priv *n_priv)
+static void flush_notifications(struct proxy_wifi_wiphy_priv *w_priv)
 {
-	cancel_work_sync(&n_priv->handle_notif);
+	cancel_work_sync(&w_priv->handle_notif);
 
 	write_lock(&proxy_wifi_notif_lock);
-	list_clear_msg(&n_priv->pending_notifs);
+	list_clear_msg(&w_priv->pending_notifs);
 	write_unlock(&proxy_wifi_notif_lock);
 }
 
@@ -547,11 +557,26 @@ static void proxy_wifi_disconnect_finalize(struct net_device *netdev,
 					   u16 reason_code);
 
 static void
-handle_disconnected_notification(struct proxy_wifi_netdev_priv *n_priv,
+handle_disconnected_notification(struct proxy_wifi_wiphy_priv *w_priv,
 				 struct proxy_wifi_msg message)
 {
+	struct wiphy *wiphy = priv_to_wiphy(w_priv);
+	struct proxy_wifi_netdev_priv *n_priv = NULL;
 	struct proxy_wifi_disconnect_notif *disconnect_notif = NULL;
 	u64 session_id = 0;
+
+	read_lock(&proxy_wifi_connection_lock);
+	if (w_priv->netdev) {
+		n_priv = netdev_priv(w_priv->netdev);
+		session_id = n_priv->connection.session_id;
+	}
+	read_unlock(&proxy_wifi_connection_lock);
+
+	if (!n_priv) {
+		wiphy_debug(wiphy,
+			    "proxy_wifi: Dropping a disconnected notification, no active netdevice\n");
+		return;
+	}
 
 	netdev_info(n_priv->upperdev,
 		    "proxy_wifi: Handling a disconnected notification\n");
@@ -562,10 +587,6 @@ handle_disconnected_notification(struct proxy_wifi_netdev_priv *n_priv,
 			    message.hdr.size);
 
 	disconnect_notif = (struct proxy_wifi_disconnect_notif *)message.body;
-
-	read_lock(&proxy_wifi_connection_lock);
-	session_id = n_priv->connection.session_id;
-	read_unlock(&proxy_wifi_connection_lock);
 
 	if (disconnect_notif->session_id < session_id) {
 		netdev_warn(n_priv->upperdev,
@@ -578,11 +599,24 @@ handle_disconnected_notification(struct proxy_wifi_netdev_priv *n_priv,
 }
 
 static void
-handle_signal_quality_notification(struct proxy_wifi_netdev_priv *n_priv,
+handle_signal_quality_notification(struct proxy_wifi_wiphy_priv *w_priv,
 				   struct proxy_wifi_msg message)
 {
+	struct wiphy *wiphy = priv_to_wiphy(w_priv);
+	struct proxy_wifi_netdev_priv *n_priv = NULL;
 	struct proxy_wifi_signal_quality_notif *signal_notif = NULL;
 
+	read_lock(&proxy_wifi_connection_lock);
+	if (w_priv->netdev) {
+		n_priv = netdev_priv(w_priv->netdev);
+	}
+	read_unlock(&proxy_wifi_connection_lock);
+
+	if (!n_priv) {
+		wiphy_debug(wiphy,
+			    "proxy_wifi: Dropping a signal quality notification, no active netdevice\n");
+		return;
+	}
 	netdev_dbg(n_priv->upperdev,
 		   "proxy_wifi: Handling a signal quality notification\n");
 
@@ -640,42 +674,38 @@ static int report_scanned_network(struct wiphy *wiphy,
 }
 
 static void
-handle_scan_results_notification(struct proxy_wifi_netdev_priv *n_priv,
+handle_scan_results_notification(struct proxy_wifi_wiphy_priv *w_priv,
 				 struct proxy_wifi_msg message)
 {
+	struct wiphy *wiphy = priv_to_wiphy(w_priv);
 	struct proxy_wifi_scan_response *scan_response = NULL;
 	struct cfg80211_scan_request *scan_request = NULL;
 	int i = 0;
 	struct proxy_wifi_bss *bss = NULL;
 	struct cfg80211_scan_info scan_info = { .aborted = false };
 
-	/* TODO guhetier: Create a decent proxy_wifi context reference the netdev and the wiphy */
-	struct wiphy *wiphy = common_wiphy;
-	struct proxy_wifi_wiphy_priv *w_priv =
-		(struct proxy_wifi_wiphy_priv *)wiphy->priv;
-
-	netdev_info(n_priv->upperdev,
+	wiphy_info(wiphy,
 		   "proxy_wifi: Handling a scan_response notification\n");
 
 	if (message.hdr.size < sizeof(struct proxy_wifi_scan_response) ||
 	    !message.body) {
-		netdev_err(n_priv->upperdev,
-			   "proxy_wifi: Invalid size for a scan results notification: %d bytes\n",
-			   message.hdr.size);
+		wiphy_err(wiphy,
+			  "proxy_wifi: Invalid size for a scan results notification: %d bytes\n",
+			  message.hdr.size);
 		return;
 	}
 	scan_response = (struct proxy_wifi_scan_response *)message.body;
 
 	/* TODO guhetier: Factor in a function (shared with scan operation) */
-	netdev_info(n_priv->upperdev, "proxy_wifi: Received %u scan results\n",
-		    scan_response->num_bss);
+	wiphy_info(wiphy, "proxy_wifi: Received %u scan results\n",
+		   scan_response->num_bss);
 
 	for (i = 0; i < scan_response->num_bss; i++) {
 		bss = &scan_response->bss[i];
 		if (!is_bss_valid(bss, &message)) {
-			netdev_warn(n_priv->upperdev,
-				    "proxy_wifi: Ignoring an invalid scan result (Index %d)",
-				    i);
+			wiphy_warn(wiphy,
+				   "proxy_wifi: Ignoring an invalid scan result (Index %d)",
+				   i);
 			continue;
 		}
 
@@ -700,35 +730,37 @@ handle_scan_results_notification(struct proxy_wifi_netdev_priv *n_priv,
 static void proxy_wifi_handle_notifications(struct work_struct *work)
 {
 	struct proxy_wifi_msg *msg = NULL;
-	struct proxy_wifi_netdev_priv *n_priv =
-		container_of(work, struct proxy_wifi_netdev_priv, handle_notif);
+	struct proxy_wifi_wiphy_priv *w_priv =
+		container_of(work, struct proxy_wifi_wiphy_priv, handle_notif);
+	struct wiphy *wiphy = priv_to_wiphy(w_priv);
 
 	for (;;) {
-		msg = pop_notification(n_priv);
+		msg = pop_notification(w_priv);
 		if (!msg)
 			/* No more notifications to process */
 			return;
 
 		/* Dispatch the notification */
 		if (msg->hdr.operation == WIFI_NOTIF_DISCONNECTED)
-			handle_disconnected_notification(n_priv, *msg);
+			handle_disconnected_notification(w_priv, *msg);
 		else if (msg->hdr.operation == WIFI_NOTIF_SIGNAL_QUALITY)
-			handle_signal_quality_notification(n_priv, *msg);
+			handle_signal_quality_notification(w_priv, *msg);
 		// TODO guhetier: Use scan notif properly
 		else if (msg->hdr.operation == WIFI_OP_SCAN_RESPONSE)
-			handle_scan_results_notification(n_priv, *msg);
+			handle_scan_results_notification(w_priv, *msg);
 		else
-			netdev_warn(n_priv->upperdev,
-				    "proxy_wifi: Received an unknown notification\n");
+			wiphy_warn(wiphy,
+				   "proxy_wifi: Received an unknown notification\n");
 		kfree(msg->body);
 		kfree(msg);
 	}
 }
 
-static int receive_notification(struct proxy_wifi_netdev_priv *n_priv,
+static int receive_notification(struct proxy_wifi_wiphy_priv *w_priv,
 				struct socket *socket)
 {
 	int error = 0;
+	struct wiphy *wiphy = priv_to_wiphy(w_priv);
 	struct proxy_wifi_msg *msg = NULL;
 
 	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
@@ -737,18 +769,18 @@ static int receive_notification(struct proxy_wifi_netdev_priv *n_priv,
 
 	error = receive_proxy_wifi_message(socket, msg);
 	if (error < 0) {
-		netdev_err(n_priv->upperdev,
+		wiphy_err(wiphy,
 			   "proxy_wifi: Failed to receive a notification, error %d\n",
 			   error);
 		kfree(msg);
 		return error;
 	}
 
-	netdev_dbg(n_priv->upperdev, "proxy_wifi: Got a notification, type %d\n",
+	wiphy_dbg(wiphy, "proxy_wifi: Got a notification, type %d\n",
 		   msg->hdr.operation);
 
 	/* Queue the notif to handle it synchronously by the workqueue */
-	queue_notification(n_priv, msg);
+	queue_notification(w_priv, msg);
 	return 0;
 }
 
@@ -805,9 +837,10 @@ static int listen_notifications(void *context)
 	int error = 0;
 	struct socket *listen_socket = NULL;
 	struct socket *connect_socket = NULL;
-	struct proxy_wifi_netdev_priv *n_priv = context;
+	struct proxy_wifi_wiphy_priv *w_priv = context;
+	struct wiphy *wiphy = priv_to_wiphy(w_priv);
 
-	error = create_listening_socket(n_priv->notification_port, &listen_socket);
+	error = create_listening_socket(w_priv->notification_port, &listen_socket);
 	if (error != 0)
 		return error;
 
@@ -818,17 +851,17 @@ static int listen_notifications(void *context)
 			error = 0;
 			continue;
 		} else if (error != 0) {
-			netdev_err(n_priv->upperdev,
-				   "proxy_wifi: Failed to accept a connection, error %d",
-				   error);
+			wiphy_err(wiphy,
+				  "proxy_wifi: Failed to accept a connection, error %d",
+				  error);
 			break;
 		}
 
-		error = receive_notification(n_priv, connect_socket);
+		error = receive_notification(w_priv, connect_socket);
 		if (error != 0) {
-			netdev_warn(n_priv->upperdev,
-				    "proxy_wifi: Failed to receive a notification, error %d",
-				    error);
+			wiphy_warn(wiphy,
+				   "proxy_wifi: Failed to receive a notification, error %d",
+				   error);
 			error = 0;
 		}
 
@@ -842,41 +875,44 @@ static int listen_notifications(void *context)
 }
 
 static int
-setup_notification_channel(struct proxy_wifi_netdev_priv *n_priv)
+setup_notification_channel(struct proxy_wifi_wiphy_priv *w_priv)
 {
 	struct task_struct *thread_res = NULL;
+	struct wiphy *wiphy = priv_to_wiphy(w_priv);
 
 	/* Start the notification handling thread */
-	thread_res = kthread_create(listen_notifications, n_priv,
+	thread_res = kthread_create(listen_notifications, w_priv,
 				    "proxy_wifi notif");
 	if (IS_ERR(thread_res)) {
-		netdev_err(n_priv->upperdev,
-			   "proxy_wifi: Failed to create the notif thread, error %ld",
-			   PTR_ERR(thread_res));
+		wiphy_err(wiphy,
+			  "proxy_wifi: Failed to create the notif thread, error %ld",
+			  PTR_ERR(thread_res));
 		return PTR_ERR(thread_res);
 	}
 
-	n_priv->notif_thread = ERR_CAST(thread_res);
+	w_priv->notif_thread = ERR_CAST(thread_res);
 	/* `put_task_struct` in `stop_notification_channel`.
 	 * Keeep the task_struct alive until `kthread_stop` if the thread exit early
 	 */
-	get_task_struct(n_priv->notif_thread);
-	wake_up_process(n_priv->notif_thread);
+	get_task_struct(w_priv->notif_thread);
+	wake_up_process(w_priv->notif_thread);
 	return 0;
 }
 
 static void
-stop_notification_channel(struct proxy_wifi_netdev_priv *n_priv)
+stop_notification_channel(struct proxy_wifi_wiphy_priv *w_priv)
 {
-	if (n_priv->notif_thread) {
-		netdev_dbg(n_priv->upperdev,
+	struct wiphy *wiphy = priv_to_wiphy(w_priv);
+
+	if (w_priv->notif_thread) {
+		wiphy_dbg(wiphy,
 			   "proxy_wifi: Waiting for notification thread completion...");
-		kthread_stop(n_priv->notif_thread);
-		put_task_struct(n_priv->notif_thread);
-		n_priv->notif_thread = NULL;
+		kthread_stop(w_priv->notif_thread);
+		put_task_struct(w_priv->notif_thread);
+		w_priv->notif_thread = NULL;
 	}
 
-	flush_notifications(n_priv);
+	flush_notifications(w_priv);
 }
 
 /* ---- Driver config data ---- */
@@ -1224,8 +1260,6 @@ static void proxy_wifi_scan_result(struct work_struct *work)
 	struct proxy_wifi_wiphy_priv *w_priv =
 		container_of(work, struct proxy_wifi_wiphy_priv, scan_result);
 	struct wiphy *wiphy = priv_to_wiphy(w_priv);
-	struct proxy_wifi_netdev_priv *n_priv =
-		netdev_priv(w_priv->scan_request->wdev->netdev);
 	struct cfg80211_scan_request *scan_request = NULL;
 	struct cfg80211_scan_info scan_info = { .aborted = false };
 	struct proxy_wifi_msg message = { 0 };
@@ -1248,7 +1282,7 @@ static void proxy_wifi_scan_result(struct work_struct *work)
 		return;
 	}
 
-	message = scan_command(n_priv->request_port, scan_request);
+	message = scan_command(w_priv->request_port, scan_request);
 	if (message.hdr.operation != WIFI_OP_SCAN_RESPONSE) {
 		wiphy_err(wiphy,
 		          "proxy_wifi: Invalid scan response (Operation: %d)\n",
@@ -1446,6 +1480,9 @@ static void proxy_wifi_connect_complete(struct work_struct *work)
 {
 	struct proxy_wifi_netdev_priv *n_priv =
 		container_of(work, struct proxy_wifi_netdev_priv, connect);
+	struct proxy_wifi_wiphy_priv *w_priv =
+		(struct proxy_wifi_wiphy_priv *)
+			n_priv->upperdev->ieee80211_ptr->wiphy->priv;
 	u16 status = WLAN_STATUS_UNSPECIFIED_FAILURE;
 	struct proxy_wifi_connect_request *connect_req_ctx = NULL;
 	bool is_up = false;
@@ -1471,7 +1508,7 @@ static void proxy_wifi_connect_complete(struct work_struct *work)
 		goto complete_connect;
 	}
 
-	message = connect_command(n_priv->request_port, connect_req_ctx);
+	message = connect_command(w_priv->request_port, connect_req_ctx);
 
 	if (message.hdr.operation != WIFI_OP_CONNECT_RESPONSE) {
 		netdev_err(n_priv->upperdev,
@@ -1491,15 +1528,16 @@ static void proxy_wifi_connect_complete(struct work_struct *work)
 		/* Set the current connection information */
 		write_lock(&proxy_wifi_connection_lock);
 		n_priv->connection.is_connected = true;
+		n_priv->connection.signal = -50;
+		n_priv->connection.session_id = connect_response->session_id;
+		n_priv->connection.tx_failed = 0;
+		n_priv->connection.tx_packets = 0;
+
 		/* Can't use ether_addr_copy: dest bssid not aligned to u16 */
 		memcpy(n_priv->connection.bssid, connect_response->bssid,
 		       sizeof(n_priv->connection.bssid));
-		n_priv->connection.signal = -50;
-		n_priv->connection.session_id = connect_response->session_id;
-		write_unlock(&proxy_wifi_connection_lock);
 
-		n_priv->connection.tx_failed = 0;
-		n_priv->connection.tx_packets = 0;
+		write_unlock(&proxy_wifi_connection_lock);
 
 		netif_carrier_on(n_priv->upperdev);
 	}
@@ -1572,6 +1610,9 @@ static void proxy_wifi_disconnect_complete(struct work_struct *work)
 {
 	struct proxy_wifi_netdev_priv *n_priv =
 		container_of(work, struct proxy_wifi_netdev_priv, disconnect);
+	struct proxy_wifi_wiphy_priv *w_priv =
+		(struct proxy_wifi_wiphy_priv *)
+			n_priv->upperdev->ieee80211_ptr->wiphy->priv;
 	struct proxy_wifi_msg message = { 0 };
 	u64 session_id = 0;
 
@@ -1579,7 +1620,7 @@ static void proxy_wifi_disconnect_complete(struct work_struct *work)
 	session_id = n_priv->connection.session_id;
 	read_unlock(&proxy_wifi_connection_lock);
 
-	message = disconnect_command(n_priv->request_port, session_id);
+	message = disconnect_command(w_priv->request_port, session_id);
 
 	netdev_info(n_priv->upperdev,
 		    "proxy_wifi: Disconnected, session id %lld\n", session_id);
@@ -1731,6 +1772,11 @@ static struct wiphy *proxy_wifi_make_wiphy(void)
 	w_priv->scan_request = NULL;
 	INIT_WORK(&w_priv->scan_result, proxy_wifi_scan_result);
 	INIT_DELAYED_WORK(&w_priv->scan_timeout, proxy_wifi_scan_timeout);
+	INIT_WORK(&w_priv->handle_notif, proxy_wifi_handle_notifications);
+	INIT_LIST_HEAD(&w_priv->pending_notifs);
+	w_priv->notif_thread = NULL;
+	w_priv->request_port = PROXY_WIFI_REQUEST_PORT;
+	w_priv->notification_port = PROXY_WIFI_NOTIFICATION_PORT;
 
 	err = wiphy_register(wiphy);
 	if (err < 0) {
@@ -1752,6 +1798,7 @@ static void proxy_wifi_destroy_wiphy(struct wiphy *wiphy)
 
 	w_priv = wiphy_priv(wiphy);
 
+	// TODO guhetier: Should be done earlier, before stoping notification and workqueue. Workqueue should be in wiphy
 	write_lock(&proxy_wifi_connection_lock);
 	w_priv->being_deleted = true;
 	write_unlock(&proxy_wifi_connection_lock);
@@ -1886,6 +1933,7 @@ static int proxy_wifi_newlink(struct net *src_net, struct net_device *dev,
 			      struct netlink_ext_ack *extack)
 {
 	struct proxy_wifi_netdev_priv *n_priv = netdev_priv(dev);
+	struct proxy_wifi_wiphy_priv *w_priv = wiphy_priv(common_wiphy);
 	int err;
 
 	netdev_info(dev, "proxy_wifi: New link\n");
@@ -1949,29 +1997,16 @@ static int proxy_wifi_newlink(struct net *src_net, struct net_device *dev,
 	n_priv->connect_req_ctx = NULL;
 	INIT_WORK(&n_priv->connect, proxy_wifi_connect_complete);
 	INIT_WORK(&n_priv->disconnect, proxy_wifi_disconnect_complete);
-	INIT_WORK(&n_priv->handle_notif, proxy_wifi_handle_notifications);
-	INIT_LIST_HEAD(&n_priv->pending_notifs);
-	n_priv->notif_thread = NULL;
 
 	write_lock(&proxy_wifi_connection_lock);
 	n_priv->connection.is_connected = false;
 	eth_zero_addr(n_priv->connection.bssid);
 	n_priv->connection.signal = 0;
-	write_unlock(&proxy_wifi_connection_lock);
-
 	n_priv->connection.tx_packets = 0;
 	n_priv->connection.tx_failed = 0;
 
-	n_priv->request_port = PROXY_WIFI_REQUEST_PORT;
-	n_priv->notification_port = PROXY_WIFI_NOTIFICATION_PORT;
-
-	err = setup_notification_channel(n_priv);
-	if (err) {
-		dev_err(&n_priv->lowerdev->dev,
-			"proxy_wifi: can't start the notification channel: %d\n",
-			err);
-		goto unregister_netdev;
-	}
+	w_priv->netdev = dev;
+	write_unlock(&proxy_wifi_connection_lock);
 
 	__module_get(THIS_MODULE);
 
@@ -1992,26 +2027,27 @@ remove_handler:
 static void proxy_wifi_dellink(struct net_device *dev, struct list_head *head)
 {
 	struct proxy_wifi_netdev_priv *n_priv = netdev_priv(dev);
+	struct proxy_wifi_wiphy_priv *w_priv = wiphy_priv(common_wiphy);
 
 	netdev_info(dev, "proxy_wifi: Delete link\n");
 
-	/* Reject incoming cfg80211 requests */
+	/* Reject incoming notifications and cfg80211 requests */
 	write_lock(&proxy_wifi_connection_lock);
 	n_priv->being_deleted = true;
+	w_priv->netdev = NULL;
 	write_unlock(&proxy_wifi_connection_lock);
 
 	if (dev->ieee80211_ptr)
 		proxy_wifi_cancel_scan(dev->ieee80211_ptr->wiphy);
 
 	proxy_wifi_cancel_connect(dev);
+	flush_workqueue(proxy_wifi_command_wq);
+	// TODO guhetier: At this point, no ctrlpath work in the driver will use the netdev anymore
 
 	kfree(n_priv->connect_req_ctx);
 	n_priv->connect_req_ctx = NULL;
 
 	netif_carrier_off(dev);
-
-	/* Stop handling notifications. */
-	stop_notification_channel(n_priv);
 
 	netdev_rx_handler_unregister(n_priv->lowerdev);
 	netdev_upper_dev_unlink(n_priv->lowerdev, dev);
@@ -2102,8 +2138,19 @@ static int __init proxy_wifi_init_module(void)
 	if (err)
 		goto destroy_wiphy;
 
+	err = setup_notification_channel(
+		(struct proxy_wifi_wiphy_priv *)common_wiphy->priv);
+	if (err) {
+		wiphy_err(common_wiphy,
+			 "proxy_wifi: can't start the notification channel: %d\n",
+			 err);
+		goto unregister_link;
+	}
+
 	return 0;
 
+unregister_link:
+	rtnl_link_unregister(&proxy_wifi_link_ops);
 destroy_wiphy:
 	proxy_wifi_destroy_wiphy(common_wiphy);
 notifier:
@@ -2114,6 +2161,10 @@ notifier:
 /* Acquires and releases the rtnl lock. */
 static void __exit proxy_wifi_cleanup_module(void)
 {
+	/* Stop handling notifications. */
+	stop_notification_channel(
+		(struct proxy_wifi_wiphy_priv *)common_wiphy->priv);
+	/* Empty the workqueue */
 	destroy_workqueue(proxy_wifi_command_wq);
 
 	/* Will delete any devices that depend on the wiphy. */
