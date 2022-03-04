@@ -1934,9 +1934,18 @@ static int proxy_wifi_newlink(struct net *src_net, struct net_device *dev,
 {
 	struct proxy_wifi_netdev_priv *n_priv = netdev_priv(dev);
 	struct proxy_wifi_wiphy_priv *w_priv = wiphy_priv(common_wiphy);
-	int err;
+	int err = 0;
+	bool netdev_already_present = false;
 
 	netdev_info(dev, "proxy_wifi: New link\n");
+
+	/* Only one netdev is supported by the driver */
+	read_lock(&proxy_wifi_connection_lock);
+	netdev_already_present = w_priv->netdev != NULL;
+	read_unlock(&proxy_wifi_connection_lock);
+
+	if (netdev_already_present)
+		return -EALREADY;
 
 	if (!tb[IFLA_LINK])
 		return -EINVAL;
