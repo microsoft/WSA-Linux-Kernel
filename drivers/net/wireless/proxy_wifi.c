@@ -121,22 +121,21 @@ struct proxy_wifi_msg {
 /* ------------- Driver private context ------------ */
 
 /* Lock to protect the proxy_wifi context */
-DEFINE_RWLOCK(proxy_wifi_connection_lock);
+DEFINE_RWLOCK(proxy_wifi_context_lock);
 
 /* Lock to protect access to the notification queue */
-// TODO guhetier: This doesn't need to be a read/write lock
-DEFINE_RWLOCK(proxy_wifi_notif_lock);
+DEFINE_SPINLOCK(proxy_wifi_notif_lock);
 
 struct connection_state {
 	u32 tx_packets;
 	u32 tx_failed;
-	/* Protected by `proxy_wifi_connection_lock` */
+	/* Protected by `proxy_wifi_context_lock` */
 	u8 bssid[ETH_ALEN];
-	/* Protected by `proxy_wifi_connection_lock` */
+	/* Protected by `proxy_wifi_context_lock` */
 	bool is_connected;
-	/* Protected by `proxy_wifi_connection_lock` */
+	/* Protected by `proxy_wifi_context_lock` */
 	s8 signal;
-	/* Protected by `proxy_wifi_connection_lock` */
+	/* Protected by `proxy_wifi_context_lock` */
 	u64 session_id;
 };
 
@@ -149,7 +148,7 @@ struct proxy_wifi_netdev_priv {
 
 	struct proxy_wifi_connect_request *connect_req_ctx;
 
-	/* Protected by rtnl lock */
+	/* Protected by `proxy_wifi_context_lock` */
 	bool is_up;
 	/* Protected by rtnl lock */
 	bool being_deleted;
@@ -171,10 +170,10 @@ struct proxy_wifi_wiphy_priv {
 	unsigned int request_port;
 	unsigned int notification_port;
 
-	/* Protected by rtnl lock */
+	/* Protectd by `proxy_wifi_context_lock` */
 	bool being_deleted;
 
-	/* Protectd by `proxy_wifi_connection_lock` */
+	/* Protectd by `proxy_wifi_context_lock` */
 	struct net_device *netdev;
 };
 
@@ -525,10 +524,10 @@ static void list_clear_msg(struct list_head *list)
 static void queue_notification(struct proxy_wifi_wiphy_priv *w_priv,
 			       struct proxy_wifi_msg *msg)
 {
-	write_lock(&proxy_wifi_notif_lock);
+	spin_lock(&proxy_wifi_notif_lock);
 	list_queue_msg(msg, &w_priv->pending_notifs);
 	queue_work(proxy_wifi_command_wq, &w_priv->handle_notif);
-	write_unlock(&proxy_wifi_notif_lock);
+	spin_unlock(&proxy_wifi_notif_lock);
 }
 
 static struct proxy_wifi_msg *
@@ -536,9 +535,9 @@ pop_notification(struct proxy_wifi_wiphy_priv *w_priv)
 {
 	struct proxy_wifi_msg *msg = NULL;
 
-	write_lock(&proxy_wifi_notif_lock);
+	spin_lock(&proxy_wifi_notif_lock);
 	msg = list_pop_msg(&w_priv->pending_notifs);
-	write_unlock(&proxy_wifi_notif_lock);
+	spin_unlock(&proxy_wifi_notif_lock);
 	return msg;
 }
 
@@ -546,9 +545,9 @@ static void flush_notifications(struct proxy_wifi_wiphy_priv *w_priv)
 {
 	cancel_work_sync(&w_priv->handle_notif);
 
-	write_lock(&proxy_wifi_notif_lock);
+	spin_lock(&proxy_wifi_notif_lock);
 	list_clear_msg(&w_priv->pending_notifs);
-	write_unlock(&proxy_wifi_notif_lock);
+	spin_unlock(&proxy_wifi_notif_lock);
 }
 
 /* ---- Notification handling ---- */
@@ -565,12 +564,12 @@ handle_disconnected_notification(struct proxy_wifi_wiphy_priv *w_priv,
 	struct proxy_wifi_disconnect_notif *disconnect_notif = NULL;
 	u64 session_id = 0;
 
-	read_lock(&proxy_wifi_connection_lock);
+	read_lock(&proxy_wifi_context_lock);
 	if (w_priv->netdev) {
 		n_priv = netdev_priv(w_priv->netdev);
 		session_id = n_priv->connection.session_id;
 	}
-	read_unlock(&proxy_wifi_connection_lock);
+	read_unlock(&proxy_wifi_context_lock);
 
 	if (!n_priv) {
 		wiphy_debug(wiphy,
@@ -606,11 +605,11 @@ handle_signal_quality_notification(struct proxy_wifi_wiphy_priv *w_priv,
 	struct proxy_wifi_netdev_priv *n_priv = NULL;
 	struct proxy_wifi_signal_quality_notif *signal_notif = NULL;
 
-	read_lock(&proxy_wifi_connection_lock);
+	read_lock(&proxy_wifi_context_lock);
 	if (w_priv->netdev) {
 		n_priv = netdev_priv(w_priv->netdev);
 	}
-	read_unlock(&proxy_wifi_connection_lock);
+	read_unlock(&proxy_wifi_context_lock);
 
 	if (!n_priv) {
 		wiphy_debug(wiphy,
@@ -630,9 +629,9 @@ handle_signal_quality_notification(struct proxy_wifi_wiphy_priv *w_priv,
 	}
 	signal_notif = (struct proxy_wifi_signal_quality_notif *)message.body;
 
-	write_lock(&proxy_wifi_connection_lock);
+	write_lock(&proxy_wifi_context_lock);
 	n_priv->connection.signal = signal_notif->signal;
-	write_unlock(&proxy_wifi_connection_lock);
+	write_unlock(&proxy_wifi_context_lock);
 }
 
 // TODO guhetier: move to a more logical spot
@@ -714,10 +713,10 @@ handle_scan_results_notification(struct proxy_wifi_wiphy_priv *w_priv,
 
 	/* Complete the scan request if needed */
 	if (scan_response->scan_complete) {
-		write_lock(&proxy_wifi_connection_lock);
+		write_lock(&proxy_wifi_context_lock);
 		scan_request = w_priv->scan_request;
 		w_priv->scan_request = NULL;
-		write_unlock(&proxy_wifi_connection_lock);
+		write_unlock(&proxy_wifi_context_lock);
 
 		if (scan_request) {
 			/* Schedules work which acquires and releases the rtnl lock. */
@@ -1238,7 +1237,7 @@ static int proxy_wifi_scan(struct wiphy *wiphy,
 
 	wiphy_info(wiphy, "proxy_wifi: Starting a scan request\n");
 
-	write_lock(&proxy_wifi_connection_lock);
+	write_lock(&proxy_wifi_context_lock);
 	if (w_priv->scan_request || w_priv->being_deleted) {
 		err = -EBUSY;
 	} else {
@@ -1250,7 +1249,7 @@ static int proxy_wifi_scan(struct wiphy *wiphy,
 		}
 	}
 
-	write_unlock(&proxy_wifi_connection_lock);
+	write_unlock(&proxy_wifi_context_lock);
 	return err;
 }
 
@@ -1270,9 +1269,9 @@ static void proxy_wifi_scan_result(struct work_struct *work)
 
 	// TODO guhetier: Need to make sure the cancel won't delete the scan request while this run
 	// or the pointer become invalid...
-	read_lock(&proxy_wifi_connection_lock);
+	read_lock(&proxy_wifi_context_lock);
 	scan_request = w_priv->scan_request;
-	read_unlock(&proxy_wifi_connection_lock);
+	read_unlock(&proxy_wifi_context_lock);
 
 	// TODO guhetier: Check this code when adding scan cancellation
 	if (!scan_request) {
@@ -1319,9 +1318,9 @@ complete_scan:
 	if (set_scan_done) {
 		/* Schedules work which acquires and releases the rtnl lock. */
 		cfg80211_scan_done(scan_request, &scan_info);
-		write_lock(&proxy_wifi_connection_lock);
+		write_lock(&proxy_wifi_context_lock);
 		w_priv->scan_request = NULL;
-		write_unlock(&proxy_wifi_connection_lock);
+		write_unlock(&proxy_wifi_context_lock);
 	}
 	kfree(message.body);
 }
@@ -1334,10 +1333,10 @@ static void proxy_wifi_scan_timeout(struct work_struct *work)
 	struct cfg80211_scan_request *scan_request = NULL;
 	struct cfg80211_scan_info scan_info = { .aborted = false };
 
-	write_lock(&proxy_wifi_connection_lock);
+	write_lock(&proxy_wifi_context_lock);
 	scan_request = w_priv->scan_request;
 	w_priv->scan_request = NULL;
-	write_unlock(&proxy_wifi_connection_lock);
+	write_unlock(&proxy_wifi_context_lock);
 
 	if (scan_request) {
 		wiphy_info(wiphy, "proxy_wifi: A scan request timed out\n");
@@ -1356,10 +1355,10 @@ static void proxy_wifi_cancel_scan(struct wiphy *wiphy)
 	cancel_work_sync(&w_priv->scan_result);
 
 	/* Complete the scan request if needed (scan work didn't run or async completion) */
-	write_lock(&proxy_wifi_connection_lock);
+	write_lock(&proxy_wifi_context_lock);
 	scan_request = w_priv->scan_request;
 	w_priv->scan_request = NULL;
-	write_unlock(&proxy_wifi_connection_lock);
+	write_unlock(&proxy_wifi_context_lock);
 
 	if (scan_request) {
 		wiphy_info(wiphy, "proxy_wifi: A scan request was canceled\n");
@@ -1433,7 +1432,7 @@ build_connect_request_cxt(struct cfg80211_connect_params *sme,
 }
 
 /* Called with the rtnl lock held. */
-/* Acquires and releases proxy_wifi_connection_lock. */
+/* Acquires and releases proxy_wifi_context_lock. */
 static int proxy_wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 			      struct cfg80211_connect_params *sme)
 {
@@ -1442,7 +1441,7 @@ static int proxy_wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 
 	netdev_info(netdev, "proxy_wifi: Starting a connection request\n");
 
-	write_lock(&proxy_wifi_connection_lock);
+	write_lock(&proxy_wifi_context_lock);
 
 	if (n_priv->being_deleted || !n_priv->is_up || n_priv->connect_req_ctx) {
 		error = -EBUSY;
@@ -1470,12 +1469,12 @@ static int proxy_wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	}
 
 out_release_lock:
-	write_unlock(&proxy_wifi_connection_lock);
+	write_unlock(&proxy_wifi_context_lock);
 	return error;
 }
 
 /* Acquires and releases the rdev event lock. */
-/* Acquires and releases proxy_wifi_connection_lock. */
+/* Acquires and releases proxy_wifi_context_lock. */
 static void proxy_wifi_connect_complete(struct work_struct *work)
 {
 	struct proxy_wifi_netdev_priv *n_priv =
@@ -1489,11 +1488,11 @@ static void proxy_wifi_connect_complete(struct work_struct *work)
 	struct proxy_wifi_connect_response *connect_response = NULL;
 	struct proxy_wifi_msg message = { 0 };
 
-	write_lock(&proxy_wifi_connection_lock);
+	write_lock(&proxy_wifi_context_lock);
 	connect_req_ctx = n_priv->connect_req_ctx;
 	n_priv->connect_req_ctx = NULL;
 	is_up = n_priv->is_up;
-	write_unlock(&proxy_wifi_connection_lock);
+	write_unlock(&proxy_wifi_context_lock);
 
 	if (!connect_req_ctx) {
 		netdev_err(n_priv->upperdev,
@@ -1526,7 +1525,7 @@ static void proxy_wifi_connect_complete(struct work_struct *work)
 
 	if (status == WLAN_STATUS_SUCCESS) {
 		/* Set the current connection information */
-		write_lock(&proxy_wifi_connection_lock);
+		write_lock(&proxy_wifi_context_lock);
 		n_priv->connection.is_connected = true;
 		n_priv->connection.signal = -50;
 		n_priv->connection.session_id = connect_response->session_id;
@@ -1537,7 +1536,7 @@ static void proxy_wifi_connect_complete(struct work_struct *work)
 		memcpy(n_priv->connection.bssid, connect_response->bssid,
 		       sizeof(n_priv->connection.bssid));
 
-		write_unlock(&proxy_wifi_connection_lock);
+		write_unlock(&proxy_wifi_context_lock);
 
 		netif_carrier_on(n_priv->upperdev);
 	}
@@ -1554,7 +1553,7 @@ complete_connect:
 }
 
 /* May acquire and release the rdev event lock. */
-/* May acquire and release proxy_wifi_connection_lock */
+/* May acquire and release proxy_wifi_context_lock */
 static void proxy_wifi_cancel_connect(struct net_device *netdev)
 {
 	u8 bssid[ETH_ALEN] = { 0 };
@@ -1565,12 +1564,12 @@ static void proxy_wifi_cancel_connect(struct net_device *netdev)
 		netdev_info(netdev,
 			    "proxy_wifi: A connection request was canceled\n");
 
-		write_lock(&proxy_wifi_connection_lock);
+		write_lock(&proxy_wifi_context_lock);
 		ether_addr_copy(bssid, n_priv->connection.bssid);
 
 		kfree(n_priv->connect_req_ctx);
 		n_priv->connect_req_ctx = NULL;
-		write_unlock(&proxy_wifi_connection_lock);
+		write_unlock(&proxy_wifi_context_lock);
 
 		/* Schedules an event that acquires the rtnl lock. */
 		cfg80211_connect_result(n_priv->upperdev, bssid, NULL, 0, NULL, 0,
@@ -1580,7 +1579,7 @@ static void proxy_wifi_cancel_connect(struct net_device *netdev)
 }
 
 /* Subcall acquires the rdev event lock. */
-/* Acquires and releases proxy_wifi_connection_lock */
+/* Acquires and releases proxy_wifi_context_lock */
 static void proxy_wifi_disconnect_finalize(struct net_device *netdev,
 					   u16 reason_code)
 {
@@ -1588,11 +1587,11 @@ static void proxy_wifi_disconnect_finalize(struct net_device *netdev,
 	bool is_connected = false;
 	bool connect_rq_pending = false;
 
-	write_lock(&proxy_wifi_connection_lock);
+	write_lock(&proxy_wifi_context_lock);
 	is_connected = n_priv->connection.is_connected;
 	connect_rq_pending = n_priv->connect_req_ctx != NULL;
 	n_priv->connection.is_connected = false;
-	write_unlock(&proxy_wifi_connection_lock);
+	write_unlock(&proxy_wifi_context_lock);
 
 	if (is_connected)
 		netif_carrier_off(netdev);
@@ -1605,7 +1604,7 @@ static void proxy_wifi_disconnect_finalize(struct net_device *netdev,
 }
 
 /* Subcall acquires the rdev event lock. */
-/* Subcall acquires and releases proxy_wifi_connection_lock */
+/* Subcall acquires and releases proxy_wifi_context_lock */
 static void proxy_wifi_disconnect_complete(struct work_struct *work)
 {
 	struct proxy_wifi_netdev_priv *n_priv =
@@ -1616,9 +1615,9 @@ static void proxy_wifi_disconnect_complete(struct work_struct *work)
 	struct proxy_wifi_msg message = { 0 };
 	u64 session_id = 0;
 
-	read_lock(&proxy_wifi_connection_lock);
+	read_lock(&proxy_wifi_context_lock);
 	session_id = n_priv->connection.session_id;
-	read_unlock(&proxy_wifi_connection_lock);
+	read_unlock(&proxy_wifi_context_lock);
 
 	message = disconnect_command(w_priv->request_port, session_id);
 
@@ -1638,7 +1637,7 @@ static void proxy_wifi_disconnect_complete(struct work_struct *work)
 
 /* Called with the rtnl lock held. */
 /* Subcall acquires and releases the rdev event lock. */
-/* Subcall acquires and releases proxy_wifi_connection_lock. */
+/* Subcall acquires and releases proxy_wifi_context_lock. */
 static int proxy_wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 				 u16 reason_code)
 {
@@ -1648,7 +1647,7 @@ static int proxy_wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 	wiphy_info(wiphy, "proxy_wifi: Starting a disconnect request\n");
 	proxy_wifi_cancel_connect(netdev);
 
-	read_lock(&proxy_wifi_connection_lock);
+	read_lock(&proxy_wifi_context_lock);
 	if (n_priv->being_deleted) {
 		err = -EBUSY;
 	}
@@ -1660,13 +1659,13 @@ static int proxy_wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 		if (!queue_work(proxy_wifi_command_wq, &n_priv->disconnect))
 			err = -EBUSY;
 	}
-	read_unlock(&proxy_wifi_connection_lock);
+	read_unlock(&proxy_wifi_context_lock);
 
 	return err;
 }
 
 /* Called with the rtnl lock held. */
-/* Acquires and releases proxy_wifi_connection_lock. */
+/* Acquires and releases proxy_wifi_context_lock. */
 static int proxy_wifi_get_station(struct wiphy *wiphy, struct net_device *dev,
 				  const u8 *mac, struct station_info *sinfo)
 {
@@ -1675,7 +1674,7 @@ static int proxy_wifi_get_station(struct wiphy *wiphy, struct net_device *dev,
 
 	wiphy_dbg(wiphy, "proxy_wifi: Reporting station info\n");
 
-	read_lock(&proxy_wifi_connection_lock);
+	read_lock(&proxy_wifi_context_lock);
 
 	if (!n_priv->connection.is_connected) {
 		error = -ENOENT;
@@ -1700,22 +1699,22 @@ static int proxy_wifi_get_station(struct wiphy *wiphy, struct net_device *dev,
 	};
 
 out_unlock:
-	read_unlock(&proxy_wifi_connection_lock);
+	read_unlock(&proxy_wifi_context_lock);
 	return error;
 }
 
 /* Called with the rtnl lock held. */
-/* Acquires and releases proxy_wifi_connection_lock. */
+/* Acquires and releases proxy_wifi_context_lock. */
 static int proxy_wifi_dump_station(struct wiphy *wiphy, struct net_device *dev,
 				   int idx, u8 *mac, struct station_info *sinfo)
 {
 	struct proxy_wifi_netdev_priv *n_priv = netdev_priv(dev);
 	bool is_connected = false;
 
-	read_lock(&proxy_wifi_connection_lock);
+	read_lock(&proxy_wifi_context_lock);
 	is_connected = n_priv->connection.is_connected;
 	ether_addr_copy(mac, n_priv->connection.bssid);
-	read_unlock(&proxy_wifi_connection_lock);
+	read_unlock(&proxy_wifi_context_lock);
 
 	if (idx != 0 || !is_connected)
 		return -ENOENT;
@@ -1799,9 +1798,9 @@ static void proxy_wifi_destroy_wiphy(struct wiphy *wiphy)
 	w_priv = wiphy_priv(wiphy);
 
 	// TODO guhetier: Should be done earlier, before stoping notification and workqueue. Workqueue should be in wiphy
-	write_lock(&proxy_wifi_connection_lock);
+	write_lock(&proxy_wifi_context_lock);
 	w_priv->being_deleted = true;
-	write_unlock(&proxy_wifi_connection_lock);
+	write_unlock(&proxy_wifi_context_lock);
 
 	proxy_wifi_cancel_scan(wiphy);
 
@@ -1811,16 +1810,16 @@ static void proxy_wifi_destroy_wiphy(struct wiphy *wiphy)
 }
 
 /* Enters and exits a RCU-bh critical section. */
-/* Aquires and releases proxy_wifi_connection_lock. */
+/* Aquires and releases proxy_wifi_context_lock. */
 static netdev_tx_t proxy_wifi_start_xmit(struct sk_buff *skb,
 					 struct net_device *dev)
 {
 	bool is_connected = false;
 	struct proxy_wifi_netdev_priv *n_priv = netdev_priv(dev);
 
-	read_lock(&proxy_wifi_connection_lock);
+	read_lock(&proxy_wifi_context_lock);
 	is_connected = n_priv->connection.is_connected;
-	read_unlock(&proxy_wifi_connection_lock);
+	read_unlock(&proxy_wifi_context_lock);
 
 	n_priv->connection.tx_packets++;
 	if (!is_connected)
@@ -1839,9 +1838,9 @@ static int proxy_wifi_net_device_open(struct net_device *dev)
 	struct proxy_wifi_netdev_priv *n_priv = netdev_priv(dev);
 
 	netdev_info(dev, "proxy_wifi: underlying device up");
-	write_lock(&proxy_wifi_connection_lock);
+	write_lock(&proxy_wifi_context_lock);
 	n_priv->is_up = true;
-	write_unlock(&proxy_wifi_connection_lock);
+	write_unlock(&proxy_wifi_context_lock);
 	return 0;
 }
 
@@ -1852,9 +1851,9 @@ static int proxy_wifi_net_device_stop(struct net_device *dev)
 
 	netdev_info(dev, "proxy_wifi: underlying device down\n");
 
-	write_lock(&proxy_wifi_connection_lock);
+	write_lock(&proxy_wifi_context_lock);
 	n_priv->is_up = false;
-	write_unlock(&proxy_wifi_connection_lock);
+	write_unlock(&proxy_wifi_context_lock);
 
 	if (!dev->ieee80211_ptr)
 		return 0;
@@ -1898,7 +1897,7 @@ static void proxy_wifi_setup(struct net_device *dev)
 }
 
 /* Called in a RCU read critical section from netif_receive_skb. */
-/* Aquires and releases proxy_wifi_connection_lock. */
+/* Aquires and releases proxy_wifi_context_lock. */
 static rx_handler_result_t proxy_wifi_rx_handler(struct sk_buff **pskb)
 {
 	bool is_connected = false;
@@ -1906,9 +1905,9 @@ static rx_handler_result_t proxy_wifi_rx_handler(struct sk_buff **pskb)
 	struct proxy_wifi_netdev_priv *n_priv =
 		rcu_dereference(skb->dev->rx_handler_data);
 
-	read_lock(&proxy_wifi_connection_lock);
+	read_lock(&proxy_wifi_context_lock);
 	is_connected = n_priv->connection.is_connected;
-	read_unlock(&proxy_wifi_connection_lock);
+	read_unlock(&proxy_wifi_context_lock);
 
 	if (!is_connected)
 		return RX_HANDLER_PASS;
@@ -1940,9 +1939,9 @@ static int proxy_wifi_newlink(struct net *src_net, struct net_device *dev,
 	netdev_info(dev, "proxy_wifi: New link\n");
 
 	/* Only one netdev is supported by the driver */
-	read_lock(&proxy_wifi_connection_lock);
+	read_lock(&proxy_wifi_context_lock);
 	netdev_already_present = w_priv->netdev != NULL;
-	read_unlock(&proxy_wifi_connection_lock);
+	read_unlock(&proxy_wifi_context_lock);
 
 	if (netdev_already_present)
 		return -EALREADY;
@@ -2007,7 +2006,7 @@ static int proxy_wifi_newlink(struct net *src_net, struct net_device *dev,
 	INIT_WORK(&n_priv->connect, proxy_wifi_connect_complete);
 	INIT_WORK(&n_priv->disconnect, proxy_wifi_disconnect_complete);
 
-	write_lock(&proxy_wifi_connection_lock);
+	write_lock(&proxy_wifi_context_lock);
 	n_priv->connection.is_connected = false;
 	eth_zero_addr(n_priv->connection.bssid);
 	n_priv->connection.signal = 0;
@@ -2015,7 +2014,7 @@ static int proxy_wifi_newlink(struct net *src_net, struct net_device *dev,
 	n_priv->connection.tx_failed = 0;
 
 	w_priv->netdev = dev;
-	write_unlock(&proxy_wifi_connection_lock);
+	write_unlock(&proxy_wifi_context_lock);
 
 	__module_get(THIS_MODULE);
 
@@ -2041,17 +2040,18 @@ static void proxy_wifi_dellink(struct net_device *dev, struct list_head *head)
 	netdev_info(dev, "proxy_wifi: Delete link\n");
 
 	/* Reject incoming notifications and cfg80211 requests */
-	write_lock(&proxy_wifi_connection_lock);
+	write_lock(&proxy_wifi_context_lock);
 	n_priv->being_deleted = true;
 	w_priv->netdev = NULL;
-	write_unlock(&proxy_wifi_connection_lock);
+	write_unlock(&proxy_wifi_context_lock);
 
 	if (dev->ieee80211_ptr)
 		proxy_wifi_cancel_scan(dev->ieee80211_ptr->wiphy);
 
 	proxy_wifi_cancel_connect(dev);
 	flush_workqueue(proxy_wifi_command_wq);
-	// TODO guhetier: At this point, no ctrlpath work in the driver will use the netdev anymore
+
+	/* At this point, no request or notif needs the netdev anymore */
 
 	kfree(n_priv->connect_req_ctx);
 	n_priv->connect_req_ctx = NULL;
