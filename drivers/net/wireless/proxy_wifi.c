@@ -174,7 +174,7 @@ struct proxy_wifi_wiphy_priv {
 	struct net_device *netdev;
 
 	/* Single threaded workqueue to serialize all exchanges with the host */
-	struct workqueue_struct *proxy_wifi_command_wq;
+	struct workqueue_struct *workqueue;
 };
 
 static struct wiphy *common_wiphy;
@@ -526,7 +526,7 @@ static void queue_notification(struct proxy_wifi_wiphy_priv *w_priv,
 {
 	spin_lock(&proxy_wifi_notif_lock);
 	list_queue_msg(msg, &w_priv->pending_notifs);
-	queue_work(w_priv->proxy_wifi_command_wq, &w_priv->handle_notif);
+	queue_work(w_priv->workqueue, &w_priv->handle_notif);
 	spin_unlock(&proxy_wifi_notif_lock);
 }
 
@@ -1242,7 +1242,7 @@ static int proxy_wifi_scan(struct wiphy *wiphy,
 		err = -EBUSY;
 	} else {
 		w_priv->scan_request = request;
-		if (!queue_work(w_priv->proxy_wifi_command_wq, &w_priv->scan_result))
+		if (!queue_work(w_priv->workqueue, &w_priv->scan_result))
 		{
 			w_priv->scan_request = NULL;
 			err = -EBUSY;
@@ -1311,7 +1311,7 @@ static void proxy_wifi_scan_result(struct work_struct *work)
 complete_scan:
 	/* More results are coming from the host through a notification. Ensure the scan will be complete in 10sec */
 	if (scan_response && !scan_response->scan_complete) {
-		if (queue_delayed_work(w_priv->proxy_wifi_command_wq,
+		if (queue_delayed_work(w_priv->workqueue,
 				       &w_priv->scan_timeout, 10 * HZ))
 			set_scan_done = false;
 	}
@@ -1464,7 +1464,7 @@ static int proxy_wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	else
 		eth_zero_addr(n_priv->connection.bssid);
 
-	if (!queue_work(w_priv->proxy_wifi_command_wq, &n_priv->connect)) {
+	if (!queue_work(w_priv->workqueue, &n_priv->connect)) {
 		error = -EBUSY;
 		kfree(n_priv->connect_req_ctx);
 		n_priv->connect_req_ctx = NULL;
@@ -1659,7 +1659,7 @@ static int proxy_wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 	// then disconnect / do nothing depending on the status
 	// Could also set the context to null to "cancel" the connection without waiting for it
 	else if (n_priv->connection.is_connected) {
-		if (!queue_work(w_priv->proxy_wifi_command_wq, &n_priv->disconnect))
+		if (!queue_work(w_priv->workqueue, &n_priv->disconnect))
 			err = -EBUSY;
 	}
 	read_unlock(&proxy_wifi_context_lock);
@@ -1781,8 +1781,8 @@ static struct wiphy *proxy_wifi_make_wiphy(void)
 	w_priv->notification_port = PROXY_WIFI_NOTIFICATION_PORT;
 
 	/* Initialize the driver workqueue */
-	w_priv->proxy_wifi_command_wq = create_singlethread_workqueue("proxy_wifi");
-	if (!w_priv->proxy_wifi_command_wq) {
+	w_priv->workqueue = create_singlethread_workqueue("proxy_wifi");
+	if (!w_priv->workqueue) {
 		wiphy_err(wiphy, "Failed creating a work queue\n");
 		err = -EINVAL;
 		goto delete_wiphy;
@@ -1806,7 +1806,7 @@ static struct wiphy *proxy_wifi_make_wiphy(void)
 delete_notif_channel:
 	stop_notification_channel(w_priv);
 delete_workqueue:
-	destroy_workqueue(w_priv->proxy_wifi_command_wq);
+	destroy_workqueue(w_priv->workqueue);
 delete_wiphy:
 	wiphy_free(wiphy);
 	return NULL;
@@ -1833,7 +1833,7 @@ static void proxy_wifi_destroy_wiphy(struct wiphy *wiphy)
 	stop_notification_channel(w_priv);
 
 	/* Empty the workqueue */
-	destroy_workqueue(w_priv->proxy_wifi_command_wq);
+	destroy_workqueue(w_priv->workqueue);
 
 	if (wiphy->registered)
 		wiphy_unregister(wiphy);
@@ -2080,7 +2080,7 @@ static void proxy_wifi_dellink(struct net_device *dev, struct list_head *head)
 		proxy_wifi_cancel_scan(dev->ieee80211_ptr->wiphy);
 
 	proxy_wifi_cancel_connect(dev);
-	flush_workqueue(w_priv->proxy_wifi_command_wq);
+	flush_workqueue(w_priv->workqueue);
 
 	/* At this point, no request or notif needs the netdev anymore */
 
