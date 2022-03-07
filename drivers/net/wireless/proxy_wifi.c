@@ -37,8 +37,6 @@ enum proxy_wifi_operation {
 	WIFI_OP_DISCONNECT_RESPONSE,
 	WIFI_NOTIF_DISCONNECTED,
 	WIFI_NOTIF_SIGNAL_QUALITY,
-	// TODO guhetier: Use or remove
-	WIFI_NOTIF_SCAN_RESULTS,
 	WIFI_OP_MAX
 };
 
@@ -634,7 +632,6 @@ handle_signal_quality_notification(struct proxy_wifi_wiphy_priv *w_priv,
 	write_unlock(&proxy_wifi_context_lock);
 }
 
-// TODO guhetier: move to a more logical spot
 static bool is_bss_valid(const struct proxy_wifi_bss *bss,
 			 const struct proxy_wifi_msg *message)
 {
@@ -644,7 +641,6 @@ static bool is_bss_valid(const struct proxy_wifi_bss *bss,
 		       (u8 *)message->body + message->hdr.size;
 }
 
-// TODO guhetier: move to a more logical spot
 static int report_scanned_network(struct wiphy *wiphy,
 				  struct proxy_wifi_bss *bss)
 {
@@ -695,7 +691,6 @@ handle_scan_results_notification(struct proxy_wifi_wiphy_priv *w_priv,
 	}
 	scan_response = (struct proxy_wifi_scan_response *)message.body;
 
-	/* TODO guhetier: Factor in a function (shared with scan operation) */
 	wiphy_info(wiphy, "proxy_wifi: Received %u scan results\n",
 		   scan_response->num_bss);
 
@@ -744,7 +739,6 @@ static void proxy_wifi_handle_notifications(struct work_struct *work)
 			handle_disconnected_notification(w_priv, *msg);
 		else if (msg->hdr.operation == WIFI_NOTIF_SIGNAL_QUALITY)
 			handle_signal_quality_notification(w_priv, *msg);
-		// TODO guhetier: Use scan notif properly
 		else if (msg->hdr.operation == WIFI_OP_SCAN_RESPONSE)
 			handle_scan_results_notification(w_priv, *msg);
 		else
@@ -1228,6 +1222,8 @@ static struct ieee80211_supported_band band_6ghz = {
 	.iftype_data = iftype_data_6ghz
 };
 
+/* ---- 80211cfg request handling ---- */
+
 /* Called with the rtnl lock held. */
 static int proxy_wifi_scan(struct wiphy *wiphy,
 			   struct cfg80211_scan_request *request)
@@ -1267,13 +1263,10 @@ static void proxy_wifi_scan_result(struct work_struct *work)
 	int i = 0;
 	bool set_scan_done = true;
 
-	// TODO guhetier: Need to make sure the cancel won't delete the scan request while this run
-	// or the pointer become invalid...
 	read_lock(&proxy_wifi_context_lock);
 	scan_request = w_priv->scan_request;
 	read_unlock(&proxy_wifi_context_lock);
 
-	// TODO guhetier: Check this code when adding scan cancellation
 	if (!scan_request) {
 		wiphy_err(
 			wiphy,
@@ -1311,8 +1304,8 @@ static void proxy_wifi_scan_result(struct work_struct *work)
 complete_scan:
 	/* More results are coming from the host through a notification. Ensure the scan will be complete in 10sec */
 	if (scan_response && !scan_response->scan_complete) {
-		if (queue_delayed_work(w_priv->workqueue,
-				       &w_priv->scan_timeout, 10 * HZ))
+		if (queue_delayed_work(w_priv->workqueue, &w_priv->scan_timeout,
+				       10 * HZ))
 			set_scan_done = false;
 	}
 
@@ -1654,10 +1647,6 @@ static int proxy_wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 	if (n_priv->being_deleted) {
 		err = -EBUSY;
 	}
-	// TODO guhetier: Always queue, decide what to do when processing?
-	// Canceling here could cause long wait, so we would rather let a potential connection complete,
-	// then disconnect / do nothing depending on the status
-	// Could also set the context to null to "cancel" the connection without waiting for it
 	else if (n_priv->connection.is_connected) {
 		if (!queue_work(w_priv->workqueue, &n_priv->disconnect))
 			err = -EBUSY;
