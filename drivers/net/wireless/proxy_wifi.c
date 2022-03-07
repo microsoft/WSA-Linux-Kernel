@@ -604,9 +604,8 @@ handle_signal_quality_notification(struct proxy_wifi_wiphy_priv *w_priv,
 	struct proxy_wifi_signal_quality_notif *signal_notif = NULL;
 
 	read_lock(&proxy_wifi_context_lock);
-	if (w_priv->netdev) {
+	if (w_priv->netdev)
 		n_priv = netdev_priv(w_priv->netdev);
-	}
 	read_unlock(&proxy_wifi_context_lock);
 
 	if (!n_priv) {
@@ -651,8 +650,8 @@ static int report_scanned_network(struct wiphy *wiphy,
 	channel = ieee80211_get_channel_khz(wiphy, bss->channel_center_freq);
 	if (!channel) {
 		wiphy_warn(wiphy,
-			 "proxy_wifi: Unsupported frequency %d, ignoring scan result\n",
-			 bss->channel_center_freq);
+			   "proxy_wifi: Unsupported frequency %d, ignoring scan result\n",
+			   bss->channel_center_freq);
 		return -EINVAL;
 	}
 
@@ -763,14 +762,14 @@ static int receive_notification(struct proxy_wifi_wiphy_priv *w_priv,
 	error = receive_proxy_wifi_message(socket, msg);
 	if (error < 0) {
 		wiphy_err(wiphy,
-			   "proxy_wifi: Failed to receive a notification, error %d\n",
-			   error);
+			  "proxy_wifi: Failed to receive a notification, error %d\n",
+			  error);
 		kfree(msg);
 		return error;
 	}
 
 	wiphy_dbg(wiphy, "proxy_wifi: Got a notification, type %d\n",
-		   msg->hdr.operation);
+		  msg->hdr.operation);
 
 	/* Queue the notif to handle it synchronously by the workqueue */
 	queue_notification(w_priv, msg);
@@ -899,7 +898,7 @@ stop_notification_channel(struct proxy_wifi_wiphy_priv *w_priv)
 
 	if (w_priv->notif_thread) {
 		wiphy_dbg(wiphy,
-			   "proxy_wifi: Waiting for notification thread completion...");
+			  "proxy_wifi: Waiting for notification thread completion...");
 		kthread_stop(w_priv->notif_thread);
 		put_task_struct(w_priv->notif_thread);
 		w_priv->notif_thread = NULL;
@@ -1238,8 +1237,7 @@ static int proxy_wifi_scan(struct wiphy *wiphy,
 		err = -EBUSY;
 	} else {
 		w_priv->scan_request = request;
-		if (!queue_work(w_priv->workqueue, &w_priv->scan_result))
-		{
+		if (!queue_work(w_priv->workqueue, &w_priv->scan_result)) {
 			w_priv->scan_request = NULL;
 			err = -EBUSY;
 		}
@@ -1268,16 +1266,15 @@ static void proxy_wifi_scan_result(struct work_struct *work)
 	read_unlock(&proxy_wifi_context_lock);
 
 	if (!scan_request) {
-		wiphy_err(
-			wiphy,
-			"proxy_wifi: No scan parameters for a scan request\n");
+		wiphy_err(wiphy,
+			  "proxy_wifi: No scan parameters for a scan request\n");
 		return;
 	}
 
 	message = scan_command(w_priv->request_port, scan_request);
 	if (message.hdr.operation != WIFI_OP_SCAN_RESPONSE) {
 		wiphy_err(wiphy,
-		          "proxy_wifi: Invalid scan response (Operation: %d)\n",
+			  "proxy_wifi: Invalid scan response (Operation: %d)\n",
 			  message.hdr.operation);
 		scan_info.aborted = true;
 		goto complete_scan;
@@ -1291,10 +1288,9 @@ static void proxy_wifi_scan_result(struct work_struct *work)
 	for (i = 0; i < scan_response->num_bss; i++) {
 		bss = &scan_response->bss[i];
 		if (!is_bss_valid(bss, &message)) {
-			wiphy_warn(
-				wiphy,
-				"proxy_wifi: Ignoring an invalid scan result (Index %d)",
-				i);
+			wiphy_warn(wiphy,
+				   "proxy_wifi: Ignoring an invalid scan result (Index %d)",
+				   i);
 			continue;
 		}
 
@@ -1302,7 +1298,9 @@ static void proxy_wifi_scan_result(struct work_struct *work)
 	}
 
 complete_scan:
-	/* More results are coming from the host through a notification. Ensure the scan will be complete in 10sec */
+	/* More results are coming from the host through a notification.
+	 * Ensure the scan will be complete in 10sec.
+	 */
 	if (scan_response && !scan_response->scan_complete) {
 		if (queue_delayed_work(w_priv->workqueue, &w_priv->scan_timeout,
 				       10 * HZ))
@@ -1321,8 +1319,8 @@ complete_scan:
 
 static void proxy_wifi_scan_timeout(struct work_struct *work)
 {
-	struct proxy_wifi_wiphy_priv *w_priv = container_of(
-		work, struct proxy_wifi_wiphy_priv, scan_timeout.work);
+	struct proxy_wifi_wiphy_priv *w_priv = container_of(work,
+			       struct proxy_wifi_wiphy_priv, scan_timeout.work);
 	struct wiphy *wiphy = priv_to_wiphy(w_priv);
 	struct cfg80211_scan_request *scan_request = NULL;
 	struct cfg80211_scan_info scan_info = { .aborted = false };
@@ -1496,9 +1494,8 @@ static void proxy_wifi_connect_complete(struct work_struct *work)
 	}
 
 	if (!is_up) {
-		netdev_err(
-			n_priv->upperdev,
-			"proxy_wifi: net_dev not up, aborting the connection request\n");
+		netdev_err(n_priv->upperdev,
+			   "proxy_wifi: net_dev not up, aborting the connection request\n");
 		goto complete_connect;
 	}
 
@@ -1584,7 +1581,7 @@ static void proxy_wifi_disconnect_finalize(struct net_device *netdev,
 
 	write_lock(&proxy_wifi_context_lock);
 	is_connected = n_priv->connection.is_connected;
-	connect_rq_pending = n_priv->connect_req_ctx != NULL;
+	connect_rq_pending = !!n_priv->connect_req_ctx;
 	n_priv->connection.is_connected = false;
 	write_unlock(&proxy_wifi_context_lock);
 
@@ -1592,7 +1589,8 @@ static void proxy_wifi_disconnect_finalize(struct net_device *netdev,
 		netif_carrier_off(netdev);
 
 	/* Don't indidicate the disconnection if another connection request has
-	 * been queued: it would be seen as a failure for the new request */
+	 * been queued: it would be seen as a failure for the new request
+	 */
 	if (is_connected && !connect_rq_pending)
 		cfg80211_disconnected(netdev, reason_code, NULL, 0, true,
 				      GFP_KERNEL);
@@ -1646,8 +1644,7 @@ static int proxy_wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 	read_lock(&proxy_wifi_context_lock);
 	if (n_priv->being_deleted) {
 		err = -EBUSY;
-	}
-	else if (n_priv->connection.is_connected) {
+	} else if (n_priv->connection.is_connected) {
 		if (!queue_work(w_priv->workqueue, &n_priv->disconnect))
 			err = -EBUSY;
 	}
@@ -1781,8 +1778,8 @@ static struct wiphy *proxy_wifi_make_wiphy(void)
 	err = setup_notification_channel(w_priv);
 	if (err) {
 		wiphy_err(wiphy,
-			 "proxy_wifi: can't start the notification channel: %d\n",
-			 err);
+			  "proxy_wifi: can't start the notification channel: %d\n",
+			  err);
 		goto delete_workqueue;
 	}
 
@@ -1888,6 +1885,7 @@ static int proxy_wifi_net_device_stop(struct net_device *dev)
 static int proxy_wifi_net_device_get_iflink(const struct net_device *dev)
 {
 	struct proxy_wifi_netdev_priv *n_priv = netdev_priv(dev);
+
 	return n_priv->lowerdev->ifindex;
 }
 
@@ -1960,7 +1958,7 @@ static int proxy_wifi_newlink(struct net *src_net, struct net_device *dev,
 
 	/* Only one netdev is supported by the driver */
 	read_lock(&proxy_wifi_context_lock);
-	netdev_already_present = w_priv->netdev != NULL;
+	netdev_already_present = !!w_priv->netdev;
 	read_unlock(&proxy_wifi_context_lock);
 
 	if (netdev_already_present)
