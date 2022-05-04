@@ -1058,6 +1058,7 @@ void vmbus_on_msg_dpc(unsigned long data)
 	struct vmbus_channel_message_header *hdr;
 	const struct vmbus_channel_message_table_entry *entry;
 	struct onmessage_work_context *ctx;
+	struct vmbus_channel_offer_channel *offer;
 	u32 message_type = msg->header.message_type;
 
 	/*
@@ -1160,6 +1161,11 @@ void vmbus_on_msg_dpc(unsigned long data)
 			 * to the CPUs which will execute the offer & rescind
 			 * works by the time these works will start execution.
 			 */
+			offer = (struct vmbus_channel_offer_channel *)&ctx->msg.payload;
+			if (offer->offer.chn_flags & VMBUS_CHANNEL_TLNPI_PROVIDER_OFFER) {
+				printk("hv_sock: waking up the VM...\n");
+				pm_wakeup_hard_event(&hv_acpi_dev->dev);
+			}
 			atomic_inc(&vmbus_connection.offer_in_progress);
 			fallthrough;
 
@@ -1292,6 +1298,8 @@ static void vmbus_chan_sched(struct hv_per_cpu_context *hv_cpu)
 			hv_begin_read(&channel->inbound);
 			fallthrough;
 		case HV_CALL_DIRECT:
+			if (is_hvsock_channel(channel))
+				pm_wakeup_hard_event(&hv_acpi_dev->dev);
 			tasklet_schedule(&channel->callback_event);
 		}
 
@@ -2228,6 +2236,8 @@ static int vmbus_acpi_remove(struct acpi_device *device)
 	struct resource *cur_res;
 	struct resource *next_res;
 
+	device_init_wakeup(&device->dev, false);
+
 	if (hyperv_mmio) {
 		if (fb_mmio) {
 			__release_region(hyperv_mmio, fb_mmio->start,
@@ -2408,6 +2418,7 @@ static int vmbus_acpi_add(struct acpi_device *device)
 		}
 	}
 	ret_val = 0;
+	device_init_wakeup(&device->dev, true);
 
 acpi_walk_err:
 	complete(&probe_event);
