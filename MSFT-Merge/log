@@ -1,0 +1,8 @@
+Name                           SHA1
+----                           ----
+configs/latte                  e3c3e4c11d67280304f1bee43e64070cd63ba8db
+feature/proxy_wifi/5.10        b4fe169ad5442defb4275bb3dd6014d4a275c607
+user/apais/hyperv-arm64-latte  a5adf0288ecb1365d9362273d6a18af145163764
+feature/hvlite_virtio_pmem/5.10 8ed02398963202256abd952bbf6d53f41eb9335b
+feature/dxgkrnl/5.10           593779568b594cf679e967c58cb270ad11e7697e
+user/apais/vpci-latte 		ca5c1f760a026ba7762e9491f6888b07ba995b4d
