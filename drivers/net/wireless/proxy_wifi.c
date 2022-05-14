@@ -144,6 +144,9 @@ struct proxy_wifi_netdev_priv {
 	struct proxy_wifi_connect_request *connect_req_ctx;
 
 	/* Protected by `proxy_wifi_context_lock` */
+	u16 disconnect_reason;
+
+	/* Protected by `proxy_wifi_context_lock` */
 	bool is_up;
 	/* Protected by rtnl lock */
 	bool being_deleted;
@@ -1331,7 +1334,7 @@ static void proxy_wifi_scan_timeout(struct work_struct *work)
 	write_unlock(&proxy_wifi_context_lock);
 
 	if (scan_request) {
-		wiphy_info(wiphy, "proxy_wifi: A scan request timed out\n");
+		wiphy_warn(wiphy, "proxy_wifi: A scan request timed out\n");
 		/* Schedules work which acquires and releases the rtnl lock. */
 		cfg80211_scan_done(scan_request, &scan_info);
 	}
@@ -1588,7 +1591,7 @@ static void proxy_wifi_disconnect_finalize(struct net_device *netdev,
 	if (is_connected)
 		netif_carrier_off(netdev);
 
-	/* Don't indidicate the disconnection if another connection request has
+	/* Don't indicate the disconnection if another connection request has
 	 * been queued: it would be seen as a failure for the new request
 	 */
 	if (is_connected && !connect_rq_pending)
@@ -1607,9 +1610,13 @@ static void proxy_wifi_disconnect_complete(struct work_struct *work)
 			n_priv->upperdev->ieee80211_ptr->wiphy->priv;
 	struct proxy_wifi_msg message = { 0 };
 	u64 session_id = 0;
+	u16 reason;
 
 	read_lock(&proxy_wifi_context_lock);
 	session_id = n_priv->connection.session_id;
+	reason = n_priv->disconnect_reason ? n_priv->disconnect_reason :
+						   WLAN_REASON_UNSPECIFIED;
+	n_priv->disconnect_reason = 0;
 	read_unlock(&proxy_wifi_context_lock);
 
 	message = disconnect_command(w_priv->request_port, session_id);
@@ -1623,7 +1630,7 @@ static void proxy_wifi_disconnect_complete(struct work_struct *work)
 			   "proxy_wifi: Expected WIFI_OP_DISCONNECT_RESPONSE, got: %d",
 			   message.hdr.operation);
 
-	proxy_wifi_disconnect_finalize(n_priv->upperdev, WLAN_REASON_UNSPECIFIED);
+	proxy_wifi_disconnect_finalize(n_priv->upperdev, reason);
 
 	kfree(message.body);
 }
@@ -1645,8 +1652,11 @@ static int proxy_wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 	if (n_priv->being_deleted) {
 		err = -EBUSY;
 	} else if (n_priv->connection.is_connected) {
-		if (!queue_work(w_priv->workqueue, &n_priv->disconnect))
+		n_priv->disconnect_reason = reason_code;
+		if (!queue_work(w_priv->workqueue, &n_priv->disconnect)) {
+			n_priv->disconnect_reason = 0;
 			err = -EBUSY;
+		}
 	}
 	read_unlock(&proxy_wifi_context_lock);
 
