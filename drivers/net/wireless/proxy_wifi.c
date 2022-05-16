@@ -527,8 +527,8 @@ static void queue_notification(struct proxy_wifi_wiphy_priv *w_priv,
 {
 	spin_lock(&proxy_wifi_notif_lock);
 	list_queue_msg(msg, &w_priv->pending_notifs);
-	queue_work(w_priv->workqueue, &w_priv->handle_notif);
 	spin_unlock(&proxy_wifi_notif_lock);
+	queue_work(w_priv->workqueue, &w_priv->handle_notif);
 }
 
 static struct proxy_wifi_msg *
@@ -1370,6 +1370,7 @@ static void proxy_wifi_abort_scan(struct wiphy *wiphy, struct wireless_dev *dev)
 	proxy_wifi_cancel_scan(wiphy);
 }
 
+/* Called with the proxy_wifi_context_lock held */
 static int
 build_connect_request_cxt(struct cfg80211_connect_params *sme,
 			  struct proxy_wifi_connect_request **connect_req_ctx)
@@ -1648,7 +1649,7 @@ static int proxy_wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 	netdev_info(netdev, "proxy_wifi: Starting a disconnect request\n");
 	proxy_wifi_cancel_connect(netdev);
 
-	read_lock(&proxy_wifi_context_lock);
+	write_lock(&proxy_wifi_context_lock);
 	if (n_priv->being_deleted) {
 		err = -EBUSY;
 	} else if (n_priv->connection.is_connected) {
@@ -1658,7 +1659,7 @@ static int proxy_wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev,
 			err = -EBUSY;
 		}
 	}
-	read_unlock(&proxy_wifi_context_lock);
+	write_unlock(&proxy_wifi_context_lock);
 
 	return err;
 }
