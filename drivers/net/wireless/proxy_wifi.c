@@ -373,7 +373,7 @@ static int query_host(struct proxy_wifi_msg *message, unsigned int port)
 	 * completed on the host: the timeout needs to be large enough for long
 	 * operations (connect) to complete.
 	*/
-	struct __kernel_sock_timeval timeout = {20, 0}; /* 20s */
+	struct __kernel_sock_timeval timeout = { .tv_sec = 20, .tv_usec = 0}; /* 20s */
 	sockptr_t timeout_ptr = { .kernel = &timeout, .is_kernel = true };
 
 	error = sock_create_kern(&init_net, AF_VSOCK, SOCK_STREAM, 0, &socket);
