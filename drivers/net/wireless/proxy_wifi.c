@@ -321,8 +321,10 @@ static int send_bytes(struct socket *socket, size_t message_size, u8 *buffer)
 		return_code = kernel_sendmsg(socket, &msg_header, &iv, 1,
 					     message_size - total_sent);
 
-		if (return_code <= 0)
+		if (return_code < 0)
 			return return_code;
+		if (return_code == 0)
+			return -EINVAL;
 
 		total_sent += return_code;
 		if (total_sent > message_size)
@@ -367,7 +369,10 @@ static int query_host(struct proxy_wifi_msg *message, unsigned int port)
 		.svm_port = port,
 		.svm_cid = VMADDR_CID_HOST,
 	};
-	/* Use a big timeout: the host might take time before answering */
+	/* The socket will wait for a response until the corresponding operation
+	 * completed on the host: the timeout needs to be large enough for long
+	 * operations (connect) to complete.
+	*/
 	struct __kernel_sock_timeval timeout = {20, 0}; /* 20s */
 	sockptr_t timeout_ptr = { .kernel = &timeout, .is_kernel = true };
 
@@ -850,11 +855,11 @@ static int accept_notification(struct proxy_wifi_wiphy_priv *w_priv,
 {
 	int error = 0;
 	struct wiphy *wiphy = priv_to_wiphy(w_priv);
-	struct socket *connect_socket = NULL;
+	struct socket *accept_socket = NULL;
 	struct __kernel_sock_timeval timeout = { 0, 10000 }; /* 10 ms */
 	sockptr_t timeout_ptr = { .kernel = &timeout, .is_kernel = true };
 
-	error = kernel_accept(listen_socket, &connect_socket, 0);
+	error = kernel_accept(listen_socket, &accept_socket, 0);
 	if (error == -EWOULDBLOCK || error == -EAGAIN)
 		return 0;
 	else if (error != 0) {
@@ -864,7 +869,7 @@ static int accept_notification(struct proxy_wifi_wiphy_priv *w_priv,
 		return error;
 	}
 
-	error = sock_setsockopt(connect_socket, SOL_SOCKET, SO_RCVTIMEO_NEW,
+	error = sock_setsockopt(accept_socket, SOL_SOCKET, SO_RCVTIMEO_NEW,
 				timeout_ptr, sizeof(timeout));
 	if (error != 0) {
 		pr_err("proxy_wifi: Failed to set a timeout on the notification socket, error %d",
@@ -872,7 +877,7 @@ static int accept_notification(struct proxy_wifi_wiphy_priv *w_priv,
 		goto out_release_sock;
 	}
 
-	error = receive_notification(w_priv, connect_socket);
+	error = receive_notification(w_priv, accept_socket);
 	if (error != 0) {
 		wiphy_warn(
 			wiphy,
@@ -884,9 +889,9 @@ static int accept_notification(struct proxy_wifi_wiphy_priv *w_priv,
 	}
 
 out_release_sock:
-	kernel_sock_shutdown(connect_socket, SHUT_RDWR);
-	sock_release(connect_socket);
-	connect_socket = NULL;
+	kernel_sock_shutdown(accept_socket, SHUT_RDWR);
+	sock_release(accept_socket);
+	accept_socket = NULL;
 	return error;
 }
 
