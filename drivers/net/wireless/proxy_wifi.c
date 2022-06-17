@@ -1741,7 +1741,7 @@ static int proxy_wifi_get_station(struct wiphy *wiphy, struct net_device *dev,
 	/* For CFG80211_SIGNAL_TYPE_MBM, value is expressed in _dBm_ */
 	sinfo->signal = n_priv->connection.signal;
 	sinfo->txrate = (struct rate_info){
-		.legacy = 10, /* units are 100kbit/s */
+		.legacy = 5000, /* units are 100kbit/s */
 	};
 
 out_unlock:
