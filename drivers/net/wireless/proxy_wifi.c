@@ -1832,13 +1832,13 @@ static struct wiphy *proxy_wifi_make_wiphy(void)
 	}
 
 	/* Get ready to accept notifications from the guest */
-	err = setup_notification_channel(w_priv);
+	/* err = setup_notification_channel(w_priv);
 	if (err) {
 		wiphy_err(wiphy,
 			  "proxy_wifi: can't start the notification channel: %d\n",
 			  err);
 		goto delete_workqueue;
-	}
+	}*/
 
 	err = wiphy_register(wiphy);
 	if (err < 0)
@@ -1847,8 +1847,8 @@ static struct wiphy *proxy_wifi_make_wiphy(void)
 	return wiphy;
 
 delete_notif_channel:
-	stop_notification_channel(w_priv);
-delete_workqueue:
+	// stop_notification_channel(w_priv);
+// delete_workqueue:
 	destroy_workqueue(w_priv->workqueue);
 delete_wiphy:
 	wiphy_free(wiphy);
@@ -1873,7 +1873,7 @@ static void proxy_wifi_destroy_wiphy(struct wiphy *wiphy)
 	proxy_wifi_cancel_scan(wiphy);
 
 	/* Stop handling notifications. */
-	stop_notification_channel(w_priv);
+	// stop_notification_channel(w_priv);
 
 	/* Empty the workqueue */
 	destroy_workqueue(w_priv->workqueue);
@@ -2024,6 +2024,15 @@ static int proxy_wifi_newlink(struct net *src_net, struct net_device *dev,
 	if (!tb[IFLA_LINK])
 		return -EINVAL;
 
+	/* Start listening for notification if not already done */
+	err = setup_notification_channel(w_priv);
+	if (err) {
+		wiphy_err(common_wiphy,
+			  "proxy_wifi: can't start the notification channel: %d\n",
+			  err);
+		return err;
+	}
+
 	netif_carrier_off(dev);
 
 	n_priv->upperdev = dev;
@@ -2125,6 +2134,9 @@ static void proxy_wifi_dellink(struct net_device *dev, struct list_head *head)
 
 	proxy_wifi_cancel_connect(dev);
 	flush_workqueue(w_priv->workqueue);
+
+	/* Stop accepting notification from the host */
+	stop_notification_channel(w_priv);
 
 	/* At this point, no request or notif needs the netdev anymore */
 
