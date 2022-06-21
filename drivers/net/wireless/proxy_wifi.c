@@ -164,6 +164,7 @@ struct proxy_wifi_wiphy_priv {
 	struct delayed_work scan_timeout;
 	/* Not protected but access are sequentials */
 	struct cfg80211_scan_request *scan_request;
+	struct socket *notification_socket;
 
 	unsigned int request_port;
 	unsigned int notification_port;
@@ -372,7 +373,7 @@ static int query_host(struct proxy_wifi_msg *message, unsigned int port)
 	/* The socket will wait for a response until the corresponding operation
 	 * completed on the host: the timeout needs to be large enough for long
 	 * operations (connect) to complete.
-	*/
+	 */
 	struct __kernel_sock_timeval timeout = { .tv_sec = 20, .tv_usec = 0}; /* 20s */
 	sockptr_t timeout_ptr = { .kernel = &timeout, .is_kernel = true };
 
@@ -395,14 +396,14 @@ static int query_host(struct proxy_wifi_msg *message, unsigned int port)
 				timeout_ptr, sizeof(timeout));
 	if (error != 0) {
 		pr_err("proxy_wifi: Failed to set a send timeout on the request socket, error %d",
-			error);
+		       error);
 		goto out_sock_release;
 	}
 	error = sock_setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO_NEW,
 				timeout_ptr, sizeof(timeout));
 	if (error != 0) {
 		pr_err("proxy_wifi: Failed to set a receive timeout on the request socket, error %d",
-			error);
+		       error);
 		goto out_sock_release;
 	}
 
@@ -850,8 +851,7 @@ out_release_sock:
 	return error;
 }
 
-static int accept_notification(struct proxy_wifi_wiphy_priv *w_priv,
-			       struct socket *listen_socket)
+static int accept_notification(struct proxy_wifi_wiphy_priv *w_priv)
 {
 	int error = 0;
 	struct wiphy *wiphy = priv_to_wiphy(w_priv);
@@ -859,10 +859,10 @@ static int accept_notification(struct proxy_wifi_wiphy_priv *w_priv,
 	struct __kernel_sock_timeval timeout = { 0, 10000 }; /* 10 ms */
 	sockptr_t timeout_ptr = { .kernel = &timeout, .is_kernel = true };
 
-	error = kernel_accept(listen_socket, &accept_socket, 0);
-	if (error == -EWOULDBLOCK || error == -EAGAIN)
+	error = kernel_accept(w_priv->notification_socket, &accept_socket, 0);
+	if (error == -EWOULDBLOCK || error == -EAGAIN) {
 		return 0;
-	else if (error != 0) {
+	} else if (error != 0) {
 		wiphy_err(wiphy,
 			  "proxy_wifi: Failed to accept a connection, error %d",
 			  error);
@@ -879,10 +879,9 @@ static int accept_notification(struct proxy_wifi_wiphy_priv *w_priv,
 
 	error = receive_notification(w_priv, accept_socket);
 	if (error != 0) {
-		wiphy_warn(
-			wiphy,
-			"proxy_wifi: Failed to receive a notification, error %d",
-			error);
+		wiphy_warn(wiphy,
+			   "proxy_wifi: Failed to receive a notification, error %d",
+			   error);
 		// Ignore this error, we can still handle next notifications
 		error = 0;
 		goto out_release_sock;
@@ -898,37 +897,38 @@ out_release_sock:
 static int listen_notifications(void *context)
 {
 	int error = 0;
-	struct socket *listen_socket = NULL;
 	struct proxy_wifi_wiphy_priv *w_priv = context;
 
-	error = create_listening_socket(w_priv->notification_port, &listen_socket);
-	if (error != 0)
-		return error;
-
 	while (!kthread_should_stop()) {
-		error = accept_notification(w_priv, listen_socket);
+		error = accept_notification(w_priv);
 		if (error != 0)
 			break;
 	}
 
-	sock_release(listen_socket);
 	return error;
 }
 
 static int
 setup_notification_channel(struct proxy_wifi_wiphy_priv *w_priv)
 {
+	int err = 0;
 	struct task_struct *thread_res = NULL;
 	struct wiphy *wiphy = priv_to_wiphy(w_priv);
+
+	err = create_listening_socket(w_priv->notification_port,
+				      &w_priv->notification_socket);
+	if (err != 0)
+		return err;
 
 	/* Start the notification handling thread */
 	thread_res = kthread_create(listen_notifications, w_priv,
 				    "proxy_wifi notif");
 	if (IS_ERR(thread_res)) {
+		err =  PTR_ERR(thread_res);
 		wiphy_err(wiphy,
-			  "proxy_wifi: Failed to create the notif thread, error %ld",
-			  PTR_ERR(thread_res));
-		return PTR_ERR(thread_res);
+			  "proxy_wifi: Failed to create the notif thread, error %d",
+			  err);
+		goto out_release_sock;
 	}
 
 	w_priv->notif_thread = ERR_CAST(thread_res);
@@ -938,6 +938,11 @@ setup_notification_channel(struct proxy_wifi_wiphy_priv *w_priv)
 	get_task_struct(w_priv->notif_thread);
 	wake_up_process(w_priv->notif_thread);
 	return 0;
+
+out_release_sock:
+	sock_release(w_priv->notification_socket);
+	w_priv->notification_socket = NULL;
+	return err;
 }
 
 static void
@@ -951,6 +956,11 @@ stop_notification_channel(struct proxy_wifi_wiphy_priv *w_priv)
 		kthread_stop(w_priv->notif_thread);
 		put_task_struct(w_priv->notif_thread);
 		w_priv->notif_thread = NULL;
+	}
+
+	if (w_priv->notification_socket) {
+		sock_release(w_priv->notification_socket);
+		w_priv->notification_socket = NULL;
 	}
 
 	flush_notifications(w_priv);
@@ -1820,6 +1830,7 @@ static struct wiphy *proxy_wifi_make_wiphy(void)
 	INIT_WORK(&w_priv->handle_notif, proxy_wifi_handle_notifications);
 	INIT_LIST_HEAD(&w_priv->pending_notifs);
 	w_priv->notif_thread = NULL;
+	w_priv->notification_socket = NULL;
 	w_priv->request_port = PROXY_WIFI_REQUEST_PORT;
 	w_priv->notification_port = PROXY_WIFI_NOTIFICATION_PORT;
 
@@ -1831,24 +1842,13 @@ static struct wiphy *proxy_wifi_make_wiphy(void)
 		goto delete_wiphy;
 	}
 
-	/* Get ready to accept notifications from the guest */
-	/* err = setup_notification_channel(w_priv);
-	if (err) {
-		wiphy_err(wiphy,
-			  "proxy_wifi: can't start the notification channel: %d\n",
-			  err);
-		goto delete_workqueue;
-	}*/
-
 	err = wiphy_register(wiphy);
 	if (err < 0)
-		goto delete_notif_channel;
+		goto delete_workqueue;
 
 	return wiphy;
 
-delete_notif_channel:
-	// stop_notification_channel(w_priv);
-// delete_workqueue:
+delete_workqueue:
 	destroy_workqueue(w_priv->workqueue);
 delete_wiphy:
 	wiphy_free(wiphy);
@@ -2024,13 +2024,15 @@ static int proxy_wifi_newlink(struct net *src_net, struct net_device *dev,
 	if (!tb[IFLA_LINK])
 		return -EINVAL;
 
-	/* Start listening for notification if not already done */
-	err = setup_notification_channel(w_priv);
-	if (err) {
-		wiphy_err(common_wiphy,
-			  "proxy_wifi: can't start the notification channel: %d\n",
-			  err);
-		return err;
+	/* Start listening for notifications if not already done */
+	if (!w_priv->notification_socket) {
+		err = setup_notification_channel(w_priv);
+		if (err) {
+			netdev_err(dev,
+				   "proxy_wifi: can't start the notification channel: %d\n",
+				   err);
+			return err;
+		}
 	}
 
 	netif_carrier_off(dev);
