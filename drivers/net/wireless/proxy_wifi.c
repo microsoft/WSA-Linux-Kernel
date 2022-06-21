@@ -860,7 +860,7 @@ static int accept_notification(struct proxy_wifi_wiphy_priv *w_priv)
 	sockptr_t timeout_ptr = { .kernel = &timeout, .is_kernel = true };
 
 	error = kernel_accept(w_priv->notification_socket, &accept_socket, 0);
-	if (error == -EWOULDBLOCK || error == -EAGAIN) {
+	if (error == -EAGAIN) {
 		return 0;
 	} else if (error != 0) {
 		wiphy_err(wiphy,
@@ -924,7 +924,7 @@ setup_notification_channel(struct proxy_wifi_wiphy_priv *w_priv)
 	thread_res = kthread_create(listen_notifications, w_priv,
 				    "proxy_wifi notif");
 	if (IS_ERR(thread_res)) {
-		err =  PTR_ERR(thread_res);
+		err = PTR_ERR(thread_res);
 		wiphy_err(wiphy,
 			  "proxy_wifi: Failed to create the notif thread, error %d",
 			  err);
@@ -1235,8 +1235,8 @@ static const struct ieee80211_sband_iftype_data iftype_data_6ghz[] = {
 					IEEE80211_HE_MAC_CAP2_ACK_EN,
 				.mac_cap_info[3] =
 					IEEE80211_HE_MAC_CAP3_OMI_CONTROL |
-					IEEE80211_HE_MAC_CAP3_MAX_AMPDU_LEN_EXP_VHT_2,
-				.mac_cap_info[4] = IEEE80211_HE_MAC_CAP4_AMDSU_IN_AMPDU,
+					IEEE80211_HE_MAC_CAP3_MAX_AMPDU_LEN_EXP_EXT_3,
+				.mac_cap_info[4] = IEEE80211_HE_MAC_CAP4_AMSDU_IN_AMPDU,
 				.phy_cap_info[0] =
 					IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G |
 					IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G |
@@ -1339,6 +1339,14 @@ static void proxy_wifi_scan_result(struct work_struct *work)
 		goto complete_scan;
 	}
 
+	if (message.hdr.size < sizeof(struct proxy_wifi_scan_response)) {
+		wiphy_err(wiphy,
+			   "proxy_wifi: Invalid scan response (Size: %d)\n",
+			   message.hdr.size);
+		scan_info.aborted = true;
+		goto complete_scan;
+	}
+
 	scan_response = (struct proxy_wifi_scan_response *)message.body;
 
 	wiphy_info(wiphy, "proxy_wifi: Received %u scan results\n",
@@ -1367,11 +1375,11 @@ complete_scan:
 	}
 
 	if (set_scan_done) {
-		/* Schedules work which acquires and releases the rtnl lock. */
-		cfg80211_scan_done(scan_request, &scan_info);
 		write_lock(&proxy_wifi_context_lock);
 		w_priv->scan_request = NULL;
 		write_unlock(&proxy_wifi_context_lock);
+		/* Schedules work which acquires and releases the rtnl lock. */
+		cfg80211_scan_done(scan_request, &scan_info);
 	}
 	kfree(message.body);
 }
@@ -1565,6 +1573,13 @@ static void proxy_wifi_connect_complete(struct work_struct *work)
 		netdev_err(n_priv->upperdev,
 			   "proxy_wifi: Invalid connect response (Operation: %d)\n",
 			   message.hdr.operation);
+		goto complete_connect;
+	}
+
+	if (message.hdr.size != sizeof(struct proxy_wifi_connect_response)) {
+		netdev_err(n_priv->upperdev,
+			   "proxy_wifi: Invalid connect response (Size: %d)\n",
+			   message.hdr.size);
 		goto complete_connect;
 	}
 
@@ -1871,9 +1886,6 @@ static void proxy_wifi_destroy_wiphy(struct wiphy *wiphy)
 	write_unlock(&proxy_wifi_context_lock);
 
 	proxy_wifi_cancel_scan(wiphy);
-
-	/* Stop handling notifications. */
-	// stop_notification_channel(w_priv);
 
 	/* Empty the workqueue */
 	destroy_workqueue(w_priv->workqueue);
