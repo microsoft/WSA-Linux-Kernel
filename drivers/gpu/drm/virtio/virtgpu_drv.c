@@ -33,14 +33,13 @@
 #include <linux/wait.h>
 
 #include <drm/drm.h>
-#include <drm/drm_aperture.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
 
 #include "virtgpu_drv.h"
 
-static const struct drm_driver driver;
+static struct drm_driver driver;
 
 static int virtio_gpu_modeset = -1;
 
@@ -59,8 +58,9 @@ static int virtio_gpu_pci_quirk(struct drm_device *dev, struct virtio_device *vd
 		 vga ? "virtio-vga" : "virtio-gpu-pci",
 		 pname);
 	if (vga) {
-		ret = drm_aperture_remove_conflicting_pci_framebuffers(pdev, &driver);
-		if (ret)
+    ret = drm_fb_helper_remove_conflicting_pci_framebuffers(pdev,
+                                                            "virtiodrmfb");
+    if (ret)
 			return ret;
 	}
 
@@ -198,7 +198,7 @@ MODULE_AUTHOR("Alon Levy");
 
 DEFINE_DRM_GEM_FOPS(virtio_gpu_driver_fops);
 
-static const struct drm_driver driver = {
+static struct drm_driver driver = {
 	.driver_features = DRIVER_MODESET | DRIVER_GEM | DRIVER_RENDER | DRIVER_ATOMIC,
 	.open = virtio_gpu_driver_open,
 	.postclose = virtio_gpu_driver_postclose,
