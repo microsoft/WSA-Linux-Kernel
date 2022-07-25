@@ -143,6 +143,8 @@ struct drm_gem_object *virtio_gpu_create_object(struct drm_device *dev,
 		return NULL;
 
 	dshmem = &shmem->base.base;
+	/* Latte requires cached memory */
+	dshmem->map_cached = true;
 	dshmem->base.funcs = &virtio_gpu_shmem_funcs;
 	return &dshmem->base;
 }
