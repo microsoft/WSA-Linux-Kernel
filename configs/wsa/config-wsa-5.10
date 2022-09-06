@@ -1,6 +1,6 @@
 #
 # Automatically generated file; DO NOT EDIT.
-# Linux/x86 5.10.110-windows-subsystem-for-android-20220617 Kernel Configuration
+# Linux/x86 5.10.117-windows-subsystem-for-android-20220804 Kernel Configuration
 #
 CONFIG_CC_VERSION_TEXT="clang version 10.0.1 (https://github.com/llvm/llvm-project ef32c611aa214dea855364efd7ba451ec5ec3f74)"
 CONFIG_GCC_VERSION=0
@@ -596,7 +596,6 @@ CONFIG_AMD_NB=y
 # Binary Emulations
 #
 CONFIG_IA32_EMULATION=y
-CONFIG_X86_X32=y
 CONFIG_COMPAT_32=y
 CONFIG_COMPAT=y
 CONFIG_COMPAT_FOR_U64_ALIGNMENT=y
@@ -2118,7 +2117,6 @@ CONFIG_HYPERV_NET=y
 # CONFIG_NETDEVSIM is not set
 CONFIG_NET_FAILOVER=y
 # CONFIG_ISDN is not set
-# CONFIG_NVM is not set
 
 #
 # Input device support
@@ -3006,9 +3004,21 @@ CONFIG_DRM=y
 # CONFIG_DRM_DP_AUX_CHARDEV is not set
 # CONFIG_DRM_DEBUG_MM is not set
 # CONFIG_DRM_DEBUG_SELFTEST is not set
+CONFIG_DRM_KMS_HELPER=y
+# CONFIG_DRM_DEBUG_DP_MST_TOPOLOGY_REFS is not set
 # CONFIG_DRM_FBDEV_EMULATION is not set
 # CONFIG_DRM_LOAD_EDID_FIRMWARE is not set
 # CONFIG_DRM_DP_CEC is not set
+CONFIG_DRM_GEM_SHMEM_HELPER=y
+
+#
+# I2C encoder or helper chips
+#
+# CONFIG_DRM_I2C_CH7006 is not set
+# CONFIG_DRM_I2C_SIL164 is not set
+# CONFIG_DRM_I2C_NXP_TDA998X is not set
+# CONFIG_DRM_I2C_NXP_TDA9950 is not set
+# end of I2C encoder or helper chips
 
 #
 # ARM devices
@@ -3028,8 +3038,16 @@ CONFIG_DRM_VGEM=y
 # CONFIG_DRM_MGAG200 is not set
 # CONFIG_DRM_QXL is not set
 # CONFIG_DRM_BOCHS is not set
-# CONFIG_DRM_VIRTIO_GPU is not set
+CONFIG_DRM_VIRTIO_GPU=y
+CONFIG_DRM_PANEL=y
+
+#
+# Display Panels
+#
+# end of Display Panels
+
 CONFIG_DRM_BRIDGE=y
+CONFIG_DRM_PANEL_BRIDGE=y
 
 #
 # Display Interface Bridges
@@ -3724,7 +3742,7 @@ CONFIG_VIRTIO_MEM=y
 CONFIG_VIRTIO_INPUT=y
 CONFIG_VIRTIO_MMIO=y
 # CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES is not set
-# CONFIG_VIRTIO_DMA_SHARED_BUFFER is not set
+CONFIG_VIRTIO_DMA_SHARED_BUFFER=y
 CONFIG_VDPA=y
 # CONFIG_IFCVF is not set
 CONFIG_VHOST_IOTLB=y
@@ -3740,8 +3758,8 @@ CONFIG_VHOST_VDPA=y
 #
 CONFIG_HYPERV=y
 CONFIG_HYPERV_TIMER=y
+# CONFIG_HYPERV_UTILS is not set
 CONFIG_HYPERV_BALLOON=y
-CONFIG_DXGKRNL=y
 # end of Microsoft Hyper-V guest support
 
 # CONFIG_GREYBUS is not set
