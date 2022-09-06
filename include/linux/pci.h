@@ -752,6 +752,10 @@ struct pci_ops {
 	int (*read)(struct pci_bus *bus, unsigned int devfn, int where, int size, u32 *val);
 	int (*write)(struct pci_bus *bus, unsigned int devfn, int where, int size, u32 val);
 
+#ifdef CONFIG_PCI_DOMAINS_GENERIC
+	int use_arch_sysdata;   /* ->sysdata is arch-specific */
+#endif
+
 	ANDROID_KABI_RESERVE(1);
 };
 
