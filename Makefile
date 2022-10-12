@@ -2,7 +2,7 @@
 VERSION = 5
 PATCHLEVEL = 10
 SUBLEVEL = 136
-EXTRAVERSION =
+EXTRAVERSION = -windows-subsystem-for-android-20221010
 NAME = Dare mighty things
 
 # *DOCUMENTATION*
