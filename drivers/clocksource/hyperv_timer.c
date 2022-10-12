@@ -565,7 +565,6 @@ void __init hv_init_clocksource(void)
 	hv_sched_clock_offset = hv_read_reference_counter();
 	hv_setup_sched_clock(read_hv_sched_clock_msr);
 }
-EXPORT_SYMBOL_GPL(hv_init_clocksource);
 
 /* Initialize everything on ARM64 */
 static int __init hyperv_timer_init(struct acpi_table_header *table)
