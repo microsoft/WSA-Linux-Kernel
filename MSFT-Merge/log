@@ -1,0 +1,7 @@
+Name                           SHA1
+----                           ----
+config/latte                   528cc23f61e37a11845c222a3c52e8e49075d964
+feature/hyperv-arm64-clock/5.10 f438a1385c923edc4a9d2c8f348c50b19ffcb68e
+product/wsa/proxy-wifi/5.10    359a552728f729f2e738220ffcdc423ceb1e3b71
+product/wsa/hvlite-virtio-pmem/5.10 8ed02398963202256abd952bbf6d53f41eb9335b
+product/wsa/virtio-gpu/5.10    364a5ccd2274d4182d3c1d7b85c2f1949b4c472a
