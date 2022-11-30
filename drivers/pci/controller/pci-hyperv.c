@@ -742,7 +742,7 @@ exit_unlock:
  * of room at the start to allow for SPIs to be specified through ACPI and
  * starting with a power of two to satisfy power of 2 multi-MSI requirement.
  */
-#define HV_PCI_MSI_SPI_START	64
+#define HV_PCI_MSI_SPI_START	40
 #define HV_PCI_MSI_SPI_NR	(1020 - HV_PCI_MSI_SPI_START)
 #define DELIVERY_MODE		0
 #define FLOW_HANDLER		NULL
