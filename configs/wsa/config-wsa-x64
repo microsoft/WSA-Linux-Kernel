@@ -1,6 +1,6 @@
 #
 # Automatically generated file; DO NOT EDIT.
-# Linux/x86 5.15.78-windows-subsystem-for-android-20230313 Kernel Configuration
+# Linux/x86 5.15.94-windows-subsystem-for-android-20230410 Kernel Configuration
 #
 CONFIG_CC_VERSION_TEXT="Ubuntu clang version 12.0.1-++20211102090516+fed41342a82f-1~exp1~20211102211019.11"
 CONFIG_GCC_VERSION=0
@@ -1029,6 +1029,7 @@ CONFIG_INET_ESP=y
 # CONFIG_INET_ESP_OFFLOAD is not set
 # CONFIG_INET_ESPINTCP is not set
 # CONFIG_INET_IPCOMP is not set
+CONFIG_INET_TABLE_PERTURB_ORDER=16
 CONFIG_INET_TUNNEL=y
 CONFIG_INET_DIAG=y
 CONFIG_INET_TCP_DIAG=y
