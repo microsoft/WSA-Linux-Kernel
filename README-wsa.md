@@ -18,7 +18,7 @@ sudo apt install -y --no-install-recommends bc bison build-essential ca-certific
 3. Setup LLVM
 
 	```shell
-	export LLVM_VERSION=10
+	export LLVM_VERSION=12
 	wget https://apt.llvm.org/llvm.sh
 	chmod +x llvm.sh
 	sudo ./llvm.sh $LLVM_VERSION
@@ -40,7 +40,12 @@ sudo apt install -y --no-install-recommends bc bison build-essential ca-certific
 	git clone https://github.com/microsoft/WSA-Linux-Kernel.git
 	export KERNEL_ROOT=~/WSA-Linux-Kernel/
 	cd WSA-Linux-Kernel
-	git checkout android-lts/latte/5.10.117.2
+
+	For v5.10.x.y
+	Eg: git checkout android-lts/latte/5.10.117.2
+
+	For v5.15.x.y
+	Eg: git checkout android-lts/latte-2/5.15.78.1
 	```
 
 5. Build the kernel
@@ -54,16 +59,21 @@ sudo apt install -y --no-install-recommends bc bison build-essential ca-certific
 	```
 
 	```
+        v5.10.x.y
 	- config-wsa-5.10 - Kernel config for x86_64
 	- config-wsa-arm64-5.10 - kernel config arm64
+
+	v5.15.x.y
+	- config-wsa-x64 - v5.15 Kernel config for x86_64
+	- config-wsa-arm64 - v5.15 Kernel config for arm64
 	```
  
-	Build WSA ARM64 kernel
-	------------------
+	Build WSA ARM64 kernel v5.10.x.y
+	--------------------------------
 
 	```shell
 	cp configs/wsa/config-wsa-arm64-5.10 $KERNEL_ROOT/.config
-
+	make olddefconfig
 	make -j`nproc` LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu Image
 	```
 
@@ -73,12 +83,27 @@ sudo apt install -y --no-install-recommends bc bison build-essential ca-certific
 	arch/arm64/boot/Image
 	```
 
-	Build WSA x86_64 kernel
-	-------------------
+	Build WSA ARM64 kernel v5.15.x.y
+	--------------------------------
+
+	```shell
+	cp configs/wsa/config-wsa-arm64 $KERNEL_ROOT/.config
+	make olddefconfig
+	make -j`nproc` LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu Image
+	```
+
+	```
+	After compilation you can find the compiled version at the following location:
+
+	arch/arm64/boot/Image
+	```
+
+	Build WSA x86_64 kernel v5.10.x.y
+	---------------------------------
 
 	```shell
 	cp configs/wsa/config-wsa-5.10 $KERNEL_ROOT/.config
-
+	make olddefconfig
 	make -j`nproc` LLVM=1 bzImage
 	```
 
@@ -88,6 +113,20 @@ sudo apt install -y --no-install-recommends bc bison build-essential ca-certific
 	arch/x86/boot/bzImage
 	```
 
+	Build WSA x86_64 kernel v5.15.x.y
+	---------------------------------
+
+	```shell
+	cp configs/wsa/config-wsa-x64 $KERNEL_ROOT/.config
+	make olddefconfig
+	make -j`nproc` LLVM=1 bzImage
+	```
+
+	```
+	After compilation you can find the compiled version at the following location:
+
+	arch/x86/boot/bzImage
+	```
 ## Info
 
 This repo is for:
