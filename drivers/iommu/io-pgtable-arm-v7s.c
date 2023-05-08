@@ -258,10 +258,6 @@ static void *__arm_v7s_alloc_table(int lvl, gfp_t gfp,
 		table = (void *)__get_free_pages(gfp_l1 | __GFP_ZERO, get_order(size));
 	else if (lvl == 2)
 		table = kmem_cache_zalloc(data->l2_tables, gfp);
-
-	if (!table)
-		return NULL;
-
 	phys = virt_to_phys(table);
 	if (cfg->quirks & IO_PGTABLE_QUIRK_ARM_MTK_TTBR_EXT ?
 	    phys >= (1ULL << cfg->oas) : phys != (arm_v7s_iopte)phys) {
@@ -269,7 +265,7 @@ static void *__arm_v7s_alloc_table(int lvl, gfp_t gfp,
 		dev_err(dev, "Page table does not fit in PTE: %pa", &phys);
 		goto out_free;
 	}
-	if (!cfg->coherent_walk) {
+	if (table && !cfg->coherent_walk) {
 		dma = dma_map_single(dev, table, size, DMA_TO_DEVICE);
 		if (dma_mapping_error(dev, dma))
 			goto out_free;
