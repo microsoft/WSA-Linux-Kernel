@@ -1,6 +1,6 @@
 #
 # Automatically generated file; DO NOT EDIT.
-# Linux/arm64 5.15.94-windows-subsystem-for-android-20230410 Kernel Configuration
+# Linux/arm64 5.15.94-windows-subsystem-for-android-20230508 Kernel Configuration
 #
 CONFIG_CC_VERSION_TEXT="Ubuntu clang version 12.0.1-++20211102090516+fed41342a82f-1~exp1~20211102211019.11"
 CONFIG_GCC_VERSION=0
@@ -2133,9 +2133,9 @@ CONFIG_WLAN_VENDOR_MICROCHIP=y
 # CONFIG_WLAN_VENDOR_TI is not set
 # CONFIG_WLAN_VENDOR_ZYDAS is not set
 # CONFIG_WLAN_VENDOR_QUANTENNA is not set
-# CONFIG_MAC80211_HWSIM is not set
+CONFIG_MAC80211_HWSIM=y
 # CONFIG_USB_NET_RNDIS_WLAN is not set
-CONFIG_VIRT_WIFI=y
+# CONFIG_VIRT_WIFI is not set
 CONFIG_PROXY_WIFI=y
 # CONFIG_WAN is not set
 
@@ -3976,7 +3976,6 @@ CONFIG_VHOST_MENU=y
 # Microsoft Hyper-V guest support
 #
 CONFIG_HYPERV=y
-CONFIG_HYPERV_TIMER=y
 # CONFIG_HYPERV_UTILS is not set
 CONFIG_HYPERV_BALLOON=y
 # end of Microsoft Hyper-V guest support
