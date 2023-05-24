@@ -1,6 +1,6 @@
 #
 # Automatically generated file; DO NOT EDIT.
-# Linux/x86 5.15.94-windows-subsystem-for-android-20230508 Kernel Configuration
+# Linux/x86 5.15.94-windows-subsystem-for-android-20230518 Kernel Configuration
 #
 CONFIG_CC_VERSION_TEXT="Ubuntu clang version 12.0.1-++20211102090516+fed41342a82f-1~exp1~20211102211019.11"
 CONFIG_GCC_VERSION=0
@@ -3793,10 +3793,11 @@ CONFIG_SYNC_FILE=y
 # CONFIG_DMABUF_MOVE_NOTIFY is not set
 # CONFIG_DMABUF_DEBUG is not set
 # CONFIG_DMABUF_SELFTESTS is not set
-# CONFIG_DMABUF_HEAPS is not set
+CONFIG_DMABUF_HEAPS=y
 # CONFIG_DMABUF_SYSFS_STATS is not set
-# CONFIG_DMABUF_HEAPS_DEFERRED_FREE is not set
-# CONFIG_DMABUF_HEAPS_PAGE_POOL is not set
+CONFIG_DMABUF_HEAPS_DEFERRED_FREE=y
+CONFIG_DMABUF_HEAPS_PAGE_POOL=y
+CONFIG_DMABUF_HEAPS_SYSTEM=y
 # end of DMABUF options
 
 # CONFIG_AUXDISPLAY is not set
