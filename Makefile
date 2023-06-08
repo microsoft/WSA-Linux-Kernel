@@ -2,7 +2,7 @@
 VERSION = 5
 PATCHLEVEL = 15
 SUBLEVEL = 104
-EXTRAVERSION =
+EXTRAVERSION = -windows-subsystem-for-android-20230608
 NAME = Trick or Treat
 
 # *DOCUMENTATION*
