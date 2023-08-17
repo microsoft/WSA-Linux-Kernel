@@ -47,7 +47,7 @@ static inline int check_xstate_in_sigframe(struct fxregs_state __user *fxbuf,
 	 * in the memory layout.
 	 */
 	if (__get_user(magic2, (__u32 __user *)(fpstate + fx_sw->xstate_size)))
-		return -EFAULT;
+		goto setfx;
 
 	if (likely(magic2 == FP_XSTATE_MAGIC2))
 		return 0;
